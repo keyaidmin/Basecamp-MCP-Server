@@ -238,6 +238,7 @@ def home():
             )
 
 @app.route('/auth/callback')
+@app.route('/callback')
 def auth_callback():
     """Handle the OAuth callback from Basecamp."""
     logger.info("OAuth callback called with args: %s", request.args)

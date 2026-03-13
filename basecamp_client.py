@@ -123,17 +123,24 @@ class BasecampClient:
             raise Exception(f"Failed to get todoset for project: {project.id}. Project response: {project}")
     
     def get_todolists(self, project_id):
-        """Get all todolists for a project."""
-        # First get the todoset ID for this project
+        """Get all todolists for a project (paginated)."""
         todoset = self.get_todoset(project_id)
         todoset_id = todoset['id']
-
-        # Then get all todolists in this todoset
-        response = self.get(f'buckets/{project_id}/todosets/{todoset_id}/todolists.json')
-        if response.status_code == 200:
-            return response.json()
-        else:
-            raise Exception(f"Failed to get todolists: {response.status_code} - {response.text}")
+        endpoint = f'buckets/{project_id}/todosets/{todoset_id}/todolists.json'
+        all_lists = []
+        page = 1
+        while True:
+            response = self.get(endpoint, params={"page": page})
+            if response.status_code != 200:
+                raise Exception(f"Failed to get todolists: {response.status_code} - {response.text}")
+            page_items = response.json() or []
+            all_lists.extend(page_items)
+            link_header = response.headers.get("Link", "")
+            has_next = 'rel="next"' in link_header if link_header else False
+            if not page_items or not has_next:
+                break
+            page += 1
+        return all_lists
 
     def get_todolist(self, project_id, todolist_id):
         """Get a specific todolist."""
@@ -513,6 +520,45 @@ class BasecampClient:
             return response.json()
         else:
             raise Exception(f"Failed to get people: {response.status_code} - {response.text}")
+
+    # Search methods (official BC3 API: https://github.com/basecamp/bc3-api/blob/master/sections/search.md)
+    def get_search_metadata(self):
+        """Get valid filter options for search (recording_search_types, file_search_types)."""
+        response = self.get('searches/metadata.json')
+        if response.status_code == 200:
+            return response.json()
+        raise Exception(f"Failed to get search metadata: {response.status_code} - {response.text}")
+
+    def search_recordings(
+        self,
+        q,
+        type=None,
+        bucket_id=None,
+        creator_id=None,
+        file_type=None,
+        exclude_chat=None,
+        page=1,
+        per_page=50,
+    ):
+        """
+        Search recordings across the account (server-side, relevance-ordered).
+        Uses GET /search.json. Optional filters from get_search_metadata().
+        """
+        params = {"q": q, "page": page, "per_page": per_page}
+        if type is not None:
+            params["type"] = type
+        if bucket_id is not None:
+            params["bucket_id"] = bucket_id
+        if creator_id is not None:
+            params["creator_id"] = creator_id
+        if file_type is not None:
+            params["file_type"] = file_type
+        if exclude_chat is not None:
+            params["exclude_chat"] = "1" if exclude_chat else "0"
+        response = self.get("search.json", params=params)
+        if response.status_code == 200:
+            return response.json()
+        raise Exception(f"Failed to search: {response.status_code} - {response.text}")
 
     # Campfire (chat) methods
     def get_campfires(self, project_id):

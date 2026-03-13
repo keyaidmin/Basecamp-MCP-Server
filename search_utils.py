@@ -150,23 +150,31 @@ class BasecampSearch:
                 except Exception as e:
                     logger.error(f"Error getting todos for todolist {todolist_id}: {str(e)}")
 
-            # Case 2: Specific project, all todolists
+            # Case 2: Specific project, all todolists and their groups
             elif project_id:
                 project = self.client.get_project(project_id)
                 todolists = self.client.get_todolists(project_id)
 
-                for todolist in todolists:
+                def add_todos(parent_id, parent_name, parent_type='todolist'):
                     try:
-                        todos = self.client.get_todos(project_id, todolist['id'])
+                        todos = self.client.get_todos(project_id, parent_id)
                         for todo in todos:
                             if not include_completed and todo.get('completed'):
                                 continue
-
                             todo['project'] = {'id': project['id'], 'name': project['name']}
-                            todo['todolist'] = {'id': todolist['id'], 'name': todolist['name']}
+                            todo['todolist'] = {'id': parent_id, 'name': parent_name}
                             all_todos.append(todo)
                     except Exception as e:
-                        logger.error(f"Error getting todos for todolist {todolist['id']}: {str(e)}")
+                        logger.error(f"Error getting todos for {parent_type} {parent_id}: {e}")
+
+                for todolist in todolists:
+                    add_todos(todolist['id'], todolist.get('name') or todolist.get('title') or 'List')
+                    try:
+                        groups = self.client.get_todolist_groups(project_id, todolist['id'])
+                        for group in groups:
+                            add_todos(group['id'], group.get('name') or group.get('title') or 'Group', 'group')
+                    except Exception as e:
+                        logger.debug(f"Error getting groups for todolist {todolist['id']}: {e}")
 
             # Case 3: All projects
             else:
@@ -662,3 +670,109 @@ class BasecampSearch:
             "campfire_lines": self.search_all_campfire_lines(query),
             "uploads": self.search_uploads(query),
         }
+
+    def get_search_metadata(self):
+        """Get valid filter options for official search API (recording types, file types)."""
+        try:
+            return self.client.get_search_metadata()
+        except Exception as e:
+            logger.error(f"Error getting search metadata: {str(e)}")
+            return {}
+
+    def search_recordings_api(
+        self,
+        query,
+        type=None,
+        bucket_id=None,
+        creator_id=None,
+        file_type=None,
+        exclude_chat=None,
+        page=1,
+        per_page=50,
+    ):
+        """
+        Search using the official Basecamp API (GET /search.json).
+        Returns relevance-ordered recordings: todos, messages, cards, documents, etc.
+        """
+        try:
+            return self.client.search_recordings(
+                q=query,
+                type=type,
+                bucket_id=bucket_id,
+                creator_id=creator_id,
+                file_type=file_type,
+                exclude_chat=exclude_chat,
+                page=page,
+                per_page=per_page,
+            )
+        except Exception as e:
+            logger.error(f"Error in search_recordings_api: {str(e)}")
+            raise
+
+    def search_recordings_api_todos_and_comments(
+        self,
+        query,
+        bucket_id=None,
+        max_results=10,
+    ):
+        """
+        Default search restricted to To-dos and Comments (recording_search_types Todo, Comment).
+        Runs two API calls and merges results (todos first, then comments), dedupes by id, returns up to max_results.
+        """
+        seen = set()
+        out = []
+        for rec_type in ("Todo", "Comment"):
+            if len(out) >= max_results:
+                break
+            try:
+                page = self.search_recordings_api(
+                    query,
+                    type=rec_type,
+                    bucket_id=bucket_id,
+                    per_page=max_results,
+                )
+                if isinstance(page, list):
+                    for r in page:
+                        rid = r.get("id")
+                        if rid not in seen:
+                            seen.add(rid)
+                            out.append(r)
+                            if len(out) >= max_results:
+                                break
+            except Exception as e:
+                logger.warning(f"search_recordings_api type={rec_type} failed: {e}")
+        return out[:max_results]
+
+    def search_recordings_in_project(self, project_id: int, query: str, max_results: int = 10):
+        """
+        Client-side search within a project (todolists/todos). Use when API search
+        does not return expected items (Basecamp index can omit or rank them low).
+        Returns recording-like dicts (id, type, title, bucket, app_url) for consistency with API.
+        """
+        try:
+            project = self.client.get_project(project_id)
+            account_id = getattr(self.client, "account_id", None) or ""
+            todos = self.search_todos(query=query, project_id=project_id, include_completed=False)
+            seen = set()
+            out = []
+            for t in todos:
+                if len(out) >= max_results:
+                    break
+                rid = t.get("id")
+                if rid in seen:
+                    continue
+                seen.add(rid)
+                app_url = f"https://3.basecamp.com/{account_id}/buckets/{project_id}/todos/{rid}"
+                out.append({
+                    "id": rid,
+                    "type": "Todo",
+                    "title": t.get("content") or t.get("name") or "",
+                    "name": t.get("content") or t.get("name") or "",
+                    "bucket": {"id": project_id, "name": project.get("name", ""), "type": "Project"},
+                    "app_url": app_url,
+                    "status": "active" if not t.get("completed") else "completed",
+                })
+            return out
+        except Exception as e:
+            logger.warning(f"search_recordings_in_project failed: {e}")
+            return []

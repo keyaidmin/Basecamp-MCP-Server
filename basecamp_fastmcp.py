@@ -156,34 +156,50 @@ async def get_project(project_id: str) -> Dict[str, Any]:
 
 @mcp.tool()
 async def search_basecamp(query: str, project_id: Optional[str] = None) -> Dict[str, Any]:
-    """Search across Basecamp projects, todos, and messages.
+    """Search Basecamp for To-dos and Comments (relevance-ordered). Returns top 10 results. Uses official API with type=Todo and type=Comment. When project_id is set, also runs client-side search in that project so items missed by the API can still be found.
     
     Args:
-        query: Search query
+        query: Search query (e.g. 'CV recognition', task name, keyword)
         project_id: Optional project ID to limit search scope
     """
     client = _get_basecamp_client()
     if not client:
         return _get_auth_error_response()
-    
     try:
         search = BasecampSearch(client=client)
-        results = {}
-
-        if project_id:
-            # Search within specific project
-            results["todolists"] = await _run_sync(search.search_todolists, query, project_id)
-            results["todos"] = await _run_sync(search.search_todos, query, project_id)
-        else:
-            # Search across all projects
-            results["projects"] = await _run_sync(search.search_projects, query)
-            results["todos"] = await _run_sync(search.search_todos, query)
-            results["messages"] = await _run_sync(search.search_messages, query)
-
+        bucket_id = int(project_id) if project_id else None
+        recordings = await _run_sync(
+            lambda: search.search_recordings_api_todos_and_comments(
+                query, bucket_id=bucket_id, max_results=10
+            )
+        )
+        if isinstance(recordings, list):
+            recordings = recordings[:10]
+        # When project_id is set, merge with client-side search in that project (API can miss some todos)
+        if project_id and isinstance(recordings, list):
+            fallback = await _run_sync(
+                lambda: search.search_recordings_in_project(bucket_id, query, max_results=10)
+            )
+            if fallback:
+                seen = {r.get("id") for r in recordings}
+                for r in fallback:
+                    if r.get("id") not in seen and len(recordings) < 10:
+                        recordings.append(r)
+                        seen.add(r.get("id"))
+                recordings = recordings[:10]
+        count = len(recordings) if isinstance(recordings, list) else 0
+        # Group by type for clients that expect projects/todos/messages (top 3 relevance-ranked)
+        results = {"recordings": recordings, "count": count}
+        if isinstance(recordings, list):
+            results["todos"] = [r for r in recordings if r.get("type") == "Todo"]
+            results["messages"] = [r for r in recordings if r.get("type") == "Message"]
+            results["comments"] = [r for r in recordings if r.get("type") == "Comment"]
+            results["projects"] = []  # API returns recordings, not project list; use bucket in each item
         return {
             "status": "success",
             "query": query,
-            "results": results
+            "results": results,
+            "count": count,
         }
     except Exception as e:
         logger.error(f"Error searching Basecamp: {e}")
@@ -562,22 +578,27 @@ async def reposition_todo(
 
 @mcp.tool()
 async def global_search(query: str) -> Dict[str, Any]:
-    """Search projects, todos and campfire messages across all projects.
+    """Search Basecamp for To-dos and Comments only (relevance-ordered). Returns top 10 results. Uses official API with type=Todo and type=Comment.
     
     Args:
-        query: Search query
+        query: Search query (e.g. 'CV recognition', task name, or keyword)
     """
     client = _get_basecamp_client()
     if not client:
         return _get_auth_error_response()
-    
     try:
         search = BasecampSearch(client=client)
-        results = await _run_sync(search.global_search, query)
+        recordings = await _run_sync(
+            lambda: search.search_recordings_api_todos_and_comments(query, max_results=10)
+        )
+        if isinstance(recordings, list):
+            recordings = recordings[:10]
+        count = len(recordings) if isinstance(recordings, list) else 0
         return {
             "status": "success",
             "query": query,
-            "results": results
+            "recordings": recordings,
+            "count": count,
         }
     except Exception as e:
         logger.error(f"Error in global search: {e}")
@@ -590,6 +611,85 @@ async def global_search(query: str) -> Dict[str, Any]:
             "error": "Execution error",
             "message": str(e)
         }
+
+
+@mcp.tool()
+async def get_search_metadata() -> Dict[str, Any]:
+    """Get valid filter options for Basecamp search (recording types, file types).
+    Use these type keys with search_recordings when filtering (e.g. type='Todo' for to-dos).
+    """
+    client = _get_basecamp_client()
+    if not client:
+        return _get_auth_error_response()
+    try:
+        search = BasecampSearch(client=client)
+        metadata = await _run_sync(search.get_search_metadata)
+        return {"status": "success", "metadata": metadata}
+    except Exception as e:
+        logger.error(f"Error getting search metadata: {e}")
+        return {"error": "Execution error", "message": str(e)}
+
+
+@mcp.tool()
+async def search_recordings(
+    query: str,
+    type: Optional[str] = None,
+    bucket_id: Optional[str] = None,
+    creator_id: Optional[str] = None,
+    file_type: Optional[str] = None,
+    exclude_chat: Optional[bool] = None,
+    page: int = 1,
+    per_page: int = 10,
+) -> Dict[str, Any]:
+    """Search across all Basecamp content using the official API (relevance-ordered).
+    Returns at most 10 recordings (to-dos, messages, cards, documents, comments, etc.).
+    Use get_search_metadata to see valid type/file_type filter values (e.g. Todo, Message, Kanban::Card).
+    
+    Args:
+        query: Search query string (required)
+        type: Optional recording type filter (e.g. 'Todo', 'Message', 'Kanban::Card')
+        bucket_id: Optional project ID to limit search
+        creator_id: Optional person ID to filter by creator
+        file_type: Optional file type (e.g. 'PDF', 'Image')
+        exclude_chat: Set true to exclude chat results
+        page: Page number (default 1)
+        per_page: Results per page (default 10; response is capped at 10)
+    """
+    client = _get_basecamp_client()
+    if not client:
+        return _get_auth_error_response()
+    try:
+        search = BasecampSearch(client=client)
+        limit = min(per_page, 10)  # cap at 10
+        results = await _run_sync(
+            lambda: search.search_recordings_api(
+                query,
+                type=type,
+                bucket_id=int(bucket_id) if bucket_id else None,
+                creator_id=int(creator_id) if creator_id else None,
+                file_type=file_type,
+                exclude_chat=exclude_chat,
+                page=page,
+                per_page=limit,
+            )
+        )
+        if isinstance(results, list):
+            results = results[:10]
+        return {
+            "status": "success",
+            "query": query,
+            "recordings": results,
+            "count": len(results) if isinstance(results, list) else 0,
+        }
+    except Exception as e:
+        logger.error(f"Error in search_recordings: {e}")
+        if "401" in str(e) and "expired" in str(e).lower():
+            return {
+                "error": "OAuth token expired",
+                "message": "Your Basecamp OAuth token expired during the API call. Please re-authenticate by visiting http://localhost:8000 and completing the OAuth flow again."
+            }
+        return {"error": "Execution error", "message": str(e)}
+
 
 @mcp.tool()
 async def get_comments(recording_id: str, project_id: str, page: int = 1) -> Dict[str, Any]:
