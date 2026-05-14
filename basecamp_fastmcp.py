@@ -13,12 +13,20 @@ from typing import Any, Dict, List, Optional
 import anyio
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
+from starlette.requests import Request
+from starlette.responses import JSONResponse, RedirectResponse
 
 # Import existing business logic
 from basecamp_client import BasecampClient
 from search_utils import BasecampSearch
+from todo_context import compact_comment, compact_comments, compact_todo, compact_todos
+from basecamp_context import load_or_create_summary
+from status_update import select_recent_comments
 import token_storage
 import auth_manager
+import request_auth
+from basecamp_mcp_oauth import BasecampMcpOAuthProvider, MCP_SCOPE, public_base_url
 from dotenv import load_dotenv
 
 # Determine project root (directory containing this script)
@@ -38,66 +46,110 @@ logging.basicConfig(
 )
 logger = logging.getLogger('basecamp_fastmcp')
 
+if os.getenv("ALLOW_INSECURE_OAUTH", "").lower() in {"1", "true", "yes"}:
+    import mcp.server.auth.routes as auth_routes
+
+    logger.warning("ALLOW_INSECURE_OAUTH is enabled; OAuth metadata will be served over HTTP")
+    auth_routes.validate_issuer_url = lambda url: None
+
+
+def _auth_settings() -> AuthSettings:
+    base_url = public_base_url()
+    resource_server_url = os.getenv("PUBLIC_MCP_URL", "").strip().rstrip("/")
+    if not resource_server_url:
+        resource_server_url = base_url if "/mcp" in base_url else f"{base_url}/mcp"
+    return AuthSettings(
+        issuer_url=base_url,
+        resource_server_url=resource_server_url,
+        client_registration_options=ClientRegistrationOptions(
+            enabled=True,
+            valid_scopes=[MCP_SCOPE],
+            default_scopes=[MCP_SCOPE],
+        ),
+        revocation_options=RevocationOptions(enabled=True),
+        required_scopes=[MCP_SCOPE],
+    )
+
+
+oauth_provider = BasecampMcpOAuthProvider()
+
 # Initialize FastMCP server
-mcp = FastMCP("basecamp")
+mcp = FastMCP(
+    "basecamp",
+    auth_server_provider=oauth_provider,
+    auth=_auth_settings(),
+    host=os.getenv("MCP_HOST", "127.0.0.1"),
+    port=int(os.getenv("MCP_PORT", "8051")),
+    streamable_http_path="/mcp",
+)
+
+
+@mcp.custom_route("/basecamp/oauth/callback", methods=["GET"])
+async def basecamp_oauth_callback(request: Request):
+    """Complete the delegated Basecamp OAuth flow for MCP authorization."""
+    error = request.query_params.get("error")
+    if error:
+        return JSONResponse({"error": error}, status_code=400)
+
+    state = request.query_params.get("state")
+    code = request.query_params.get("code")
+    if not state or not code:
+        return JSONResponse({"error": "Missing OAuth state or code"}, status_code=400)
+
+    try:
+        redirect_url = await oauth_provider.complete_basecamp_authorization(state, code)
+        return RedirectResponse(redirect_url, status_code=302)
+    except Exception as exc:
+        logger.exception("Basecamp OAuth callback failed")
+        return JSONResponse({"error": "OAuth callback failed", "message": str(exc)}, status_code=400)
 
 # Auth helper functions (reused from original server)
 def _get_basecamp_client() -> Optional[BasecampClient]:
     """Get authenticated Basecamp client (sync version from original server)."""
-    try:
-        token_data = token_storage.get_token()
-        logger.debug(f"Token data retrieved: {token_data}")
-
-        if not token_data or not token_data.get('access_token'):
-            logger.error("No OAuth token available")
-            return None
-
-        # Check and automatically refresh if token is expired
-        if not auth_manager.ensure_authenticated():
-            logger.error("OAuth token has expired and automatic refresh failed")
-            return None
-
-        # Get fresh token data after potential refresh
-        token_data = token_storage.get_token()
-
-        # Get account_id from token data first, then fall back to env var
-        account_id = token_data.get('account_id') or os.getenv('BASECAMP_ACCOUNT_ID')
-        user_agent = os.getenv('USER_AGENT') or "Basecamp MCP Server (cursor@example.com)"
-
-        if not account_id:
-            logger.error(f"Missing account_id. Token data: {token_data}, Env BASECAMP_ACCOUNT_ID: {os.getenv('BASECAMP_ACCOUNT_ID')}")
-            return None
-
-        logger.debug(f"Creating Basecamp client with account_id: {account_id}, user_agent: {user_agent}")
-
-        return BasecampClient(
-            access_token=token_data['access_token'],
-            account_id=account_id,
-            user_agent=user_agent,
-            auth_mode='oauth'
-        )
-    except Exception as e:
-        logger.error(f"Error creating Basecamp client: {e}")
-        return None
+    return request_auth.get_basecamp_client()
 
 def _get_auth_error_response() -> Dict[str, Any]:
     """Return consistent auth error response."""
-    if token_storage.is_token_expired():
-        return {
-            "error": "OAuth token expired",
-            "message": "Your Basecamp OAuth token has expired. Please re-authenticate by visiting http://localhost:8000 and completing the OAuth flow again."
-        }
-    else:
-        return {
-            "error": "Authentication required", 
-            "message": "Please authenticate with Basecamp first. Visit http://localhost:8000 to log in."
-        }
+    return request_auth.auth_error_response()
 
 async def _run_sync(func, *args, **kwargs):
     """Wrapper to run synchronous functions in thread pool."""
     return await anyio.to_thread.run_sync(func, *args, **kwargs)
 
 # Core MCP Tools - Starting with essential ones from original server
+
+@mcp.tool()
+async def get_auth_status() -> Dict[str, Any]:
+    """Get authentication status for the current Basecamp MCP user."""
+    return {"status": "success", "auth": request_auth.auth_status()}
+
+
+@mcp.tool()
+async def list_basecamp_accounts() -> Dict[str, Any]:
+    """List Basecamp accounts available to the current authenticated user."""
+    accounts = request_auth.list_accounts()
+    if not accounts:
+        return _get_auth_error_response()
+    return {"status": "success", "accounts": accounts, "count": len(accounts)}
+
+
+@mcp.tool()
+async def set_active_basecamp_account(account_id: str) -> Dict[str, Any]:
+    """Set the active Basecamp account for future tool calls.
+
+    Args:
+        account_id: The Basecamp account ID returned by list_basecamp_accounts
+    """
+    if request_auth.set_active_account(account_id):
+        return {
+            "status": "success",
+            "message": f"Active Basecamp account set to {account_id}",
+        }
+    return {
+        "error": "Invalid account",
+        "message": "The current authenticated user does not have access to that Basecamp account.",
+    }
+
 
 @mcp.tool()
 async def get_projects() -> Dict[str, Any]:
@@ -174,13 +226,14 @@ async def search_basecamp(query: str, project_id: Optional[str] = None) -> Dict[
             )
         )
         if isinstance(recordings, list):
-            recordings = recordings[:10]
+            recordings = compact_todos(recordings[:10])
         # When project_id is set, merge with client-side search in that project (API can miss some todos)
         if project_id and isinstance(recordings, list):
             fallback = await _run_sync(
                 lambda: search.search_recordings_in_project(bucket_id, query, max_results=10)
             )
             if fallback:
+                fallback = compact_todos(fallback)
                 seen = {r.get("id") for r in recordings}
                 for r in fallback:
                     if r.get("id") not in seen and len(recordings) < 10:
@@ -257,6 +310,7 @@ async def get_todos(project_id: str, todolist_id: str) -> Dict[str, Any]:
     
     try:
         todos = await _run_sync(client.get_todos, project_id, todolist_id)
+        todos = compact_todos(todos)
         return {
             "status": "success",
             "todos": todos,
@@ -264,6 +318,179 @@ async def get_todos(project_id: str, todolist_id: str) -> Dict[str, Any]:
         }
     except Exception as e:
         logger.error(f"Error getting todos: {e}")
+        if "401" in str(e) and "expired" in str(e).lower():
+            return {
+                "error": "OAuth token expired",
+                "message": "Your Basecamp OAuth token expired during the API call. Please re-authenticate by visiting http://localhost:8000 and completing the OAuth flow again."
+            }
+        return {
+            "error": "Execution error",
+            "message": str(e)
+        }
+
+@mcp.tool()
+async def get_project_todos(project_id: str, status: str = "active", limit: int = 50) -> Dict[str, Any]:
+    """Get todos inside a project, newest updated first, with compact task context.
+
+    Args:
+        project_id: Project ID
+        status: Recording status to request from Basecamp, usually active
+        limit: Maximum number of todos to return
+    """
+    client = _get_basecamp_client()
+    if not client:
+        return _get_auth_error_response()
+
+    try:
+        safe_limit = max(1, min(int(limit), 100))
+        todos = await _run_sync(client.get_project_todos, project_id, status, safe_limit)
+        todos = compact_todos(todos)
+        return {
+            "status": "success",
+            "project_id": project_id,
+            "todos": todos,
+            "count": len(todos)
+        }
+    except Exception as e:
+        logger.error(f"Error getting project todos for {project_id}: {e}")
+        if "401" in str(e) and "expired" in str(e).lower():
+            return {
+                "error": "OAuth token expired",
+                "message": "Your Basecamp OAuth token expired during the API call. Please re-authenticate by visiting http://localhost:8000 and completing the OAuth flow again."
+            }
+        return {
+            "error": "Execution error",
+            "message": str(e)
+        }
+
+
+@mcp.tool()
+async def get_project_status_update(
+    project_id: str,
+    todo_limit: int = 10,
+    comments_per_todo: int = 5,
+    days: int = 7,
+) -> Dict[str, Any]:
+    """Get compact project status from recent updated todos and their recent comments.
+
+    Args:
+        project_id: Project ID
+        todo_limit: Maximum number of recently updated todos to inspect
+        comments_per_todo: Recent comments returned per todo
+        days: Comment recency window; falls back to latest comments when none are in this window
+    """
+    client = _get_basecamp_client()
+    if not client:
+        return _get_auth_error_response()
+
+    try:
+        safe_todo_limit = max(1, min(int(todo_limit), 25))
+        safe_comment_limit = max(1, min(int(comments_per_todo), 10))
+        safe_days = max(1, min(int(days), 30))
+
+        raw_todos = await _run_sync(client.get_project_todos, project_id, "active", safe_todo_limit)
+        todos = compact_todos(raw_todos)
+        updates = []
+
+        for todo in todos:
+            todo_id = str(todo.get("id"))
+            comment_result = await _run_sync(client.get_all_comments, project_id, todo_id)
+            compacted_comments = compact_comments(comment_result.get("comments", []))
+            selected_comments = select_recent_comments(
+                compacted_comments,
+                days=safe_days,
+                fallback_count=safe_comment_limit,
+            )
+            context = load_or_create_summary(project_id, todo_id, compacted_comments)
+            updates.append({
+                "todo": todo,
+                "comment_context": {
+                    "summary": context["summary"],
+                    "cached": context["cached"],
+                    "latest_comment_at": context["latest_comment_at"],
+                    "total_fetched_comments": len(compacted_comments),
+                    "total_comments": comment_result.get("total_count"),
+                    "has_more_comments": comment_result.get("has_more", False),
+                    "returned_recent_comments": len(selected_comments),
+                },
+                "recent_comments": selected_comments,
+            })
+
+        return {
+            "status": "success",
+            "project_id": project_id,
+            "todo_count": len(updates),
+            "days": safe_days,
+            "updates": updates,
+        }
+    except Exception as e:
+        logger.error(f"Error getting project status update for {project_id}: {e}")
+        if "401" in str(e) and "expired" in str(e).lower():
+            return {
+                "error": "OAuth token expired",
+                "message": "Your Basecamp OAuth token expired during the API call. Please re-authenticate by visiting http://localhost:8000 and completing the OAuth flow again."
+            }
+        return {
+            "error": "Execution error",
+            "message": str(e)
+        }
+
+
+@mcp.tool()
+async def prepare_todo_context(
+    project_id: str,
+    todo_id: str,
+    force_refresh: bool = False,
+    max_comment_pages: int = 4,
+) -> Dict[str, Any]:
+    """Prepare and cache a compact summary of a Basecamp todo's full comment context.
+
+    Use this tool when the user asks for a task/todo summary, asks what happened
+    in a todo, or needs the full task context without reading all comments again.
+
+    Args:
+        project_id: Project ID
+        todo_id: Todo ID
+        force_refresh: Rebuild the cached summary even when comments are unchanged
+        max_comment_pages: Maximum Basecamp comment pages to fetch for summary preparation
+    """
+    client = _get_basecamp_client()
+    if not client:
+        return _get_auth_error_response()
+
+    try:
+        safe_max_pages = max(1, min(int(max_comment_pages), 10))
+        raw_todo = await _run_sync(client.get_todo, project_id, todo_id)
+        todo = compact_todo(raw_todo)
+        comment_result = await _run_sync(client.get_all_comments, project_id, todo_id, safe_max_pages)
+        comments = compact_comments(comment_result.get("comments", []))
+        context = load_or_create_summary(
+            project_id,
+            todo_id,
+            comments,
+            force_refresh=force_refresh,
+            total_comments=comment_result.get("total_count"),
+            fetched_comments=len(comments),
+            has_more_comments=comment_result.get("has_more", False),
+        )
+        return {
+            "status": "success",
+            "project_id": project_id,
+            "todo_id": todo_id,
+            "todo": todo,
+            "context": {
+                "summary": context["summary"],
+                "cached": context["cached"],
+                "cache_created_at": context["cache_created_at"],
+                "cache_updated_at": context["cache_updated_at"],
+                "latest_comment_at": context["latest_comment_at"],
+                "total_comments": context["total_comments"],
+                "total_fetched_comments": context["fetched_comments"],
+                "has_more_comments": context["has_more_comments"],
+            },
+        }
+    except Exception as e:
+        logger.error(f"Error preparing todo context for {todo_id}: {e}")
         if "401" in str(e) and "expired" in str(e).lower():
             return {
                 "error": "OAuth token expired",
@@ -290,7 +517,7 @@ async def get_todo(project_id: str, todo_id: str) -> Dict[str, Any]:
         todo = await _run_sync(client.get_todo, project_id, todo_id)
         return {
             "status": "success",
-            "todo": todo
+            "todo": compact_todo(todo)
         }
     except Exception as e:
         logger.error(f"Error getting todo {todo_id}: {e}")
@@ -344,7 +571,7 @@ async def create_todo(project_id: str, todolist_id: str, content: str,
         )
         return {
             "status": "success",
-            "todo": todo,
+            "todo": compact_todo(todo),
             "message": f"Todo '{content}' created successfully"
         }
     except Exception as e:
@@ -408,7 +635,7 @@ async def update_todo(project_id: str, todo_id: str,
         )
         return {
             "status": "success",
-            "todo": todo,
+            "todo": compact_todo(todo),
             "message": "Todo updated successfully"
         }
     except Exception as e:
@@ -592,7 +819,7 @@ async def global_search(query: str) -> Dict[str, Any]:
             lambda: search.search_recordings_api_todos_and_comments(query, max_results=10)
         )
         if isinstance(recordings, list):
-            recordings = recordings[:10]
+            recordings = compact_todos(recordings[:10])
         count = len(recordings) if isinstance(recordings, list) else 0
         return {
             "status": "success",
@@ -675,6 +902,8 @@ async def search_recordings(
         )
         if isinstance(results, list):
             results = results[:10]
+            if type == "Todo":
+                results = compact_todos(results)
         return {
             "status": "success",
             "query": query,
@@ -707,10 +936,11 @@ async def get_comments(recording_id: str, project_id: str, page: int = 1) -> Dic
 
     try:
         result = await _run_sync(client.get_comments, project_id, recording_id, page)
+        comments = compact_comments(result["comments"])
         return {
             "status": "success",
-            "comments": result["comments"],
-            "count": len(result["comments"]),
+            "comments": comments,
+            "count": len(comments),
             "page": page,
             "total_count": result["total_count"],
             "next_page": result["next_page"]
@@ -744,7 +974,7 @@ async def create_comment(recording_id: str, project_id: str, content: str) -> Di
         comment = await _run_sync(client.create_comment, recording_id, project_id, content)
         return {
             "status": "success",
-            "comment": comment,
+            "comment": compact_comment(comment),
             "message": "Comment created successfully"
         }
     except Exception as e:

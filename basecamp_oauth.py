@@ -33,7 +33,7 @@ class BasecampOAuth:
         if not all([self.client_id, self.client_secret, self.redirect_uri, self.user_agent]):
             raise ValueError("Missing required OAuth credentials. Set them in .env file or pass them to the constructor.")
 
-    def get_authorization_url(self, state=None):
+    def get_authorization_url(self, state=None, scope=None):
         """
         Get the URL to redirect the user to for authorization.
 
@@ -44,13 +44,15 @@ class BasecampOAuth:
             str: The authorization URL
         """
         params = {
-            'type': 'web_server',
+            'response_type': 'code',
             'client_id': self.client_id,
             'redirect_uri': self.redirect_uri
         }
 
         if state:
             params['state'] = state
+        if scope:
+            params['scope'] = scope
 
         return f"{AUTH_URL}?{urlencode(params)}"
 

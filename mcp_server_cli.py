@@ -12,6 +12,9 @@ import logging
 from typing import Any, Dict, List, Optional
 from basecamp_client import BasecampClient
 from search_utils import BasecampSearch
+from todo_context import compact_comment, compact_comments, compact_todo, compact_todos
+from basecamp_context import load_or_create_summary
+from status_update import select_recent_comments
 import token_storage
 import auth_manager
 import os
@@ -79,7 +82,7 @@ class MCPServer:
             },
             {
                 "name": "get_todos",
-                "description": "Get todos from a todo list",
+                "description": "Get compact todos from a todo list",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -87,6 +90,47 @@ class MCPServer:
                         "todolist_id": {"type": "string", "description": "The todo list ID"},
                     },
                     "required": ["project_id", "todolist_id"]
+                }
+            },
+            {
+                "name": "get_project_todos",
+                "description": "Get compact todos inside a project, newest updated first",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string", "description": "Project ID"},
+                        "status": {"type": "string", "description": "Recording status to request, usually active"},
+                        "limit": {"type": "integer", "description": "Maximum todos to return"}
+                    },
+                    "required": ["project_id"]
+                }
+            },
+            {
+                "name": "get_project_status_update",
+                "description": "Get compact project status from recent updated todos and their recent comments",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string", "description": "Project ID"},
+                        "todo_limit": {"type": "integer", "description": "Maximum recently updated todos to inspect"},
+                        "comments_per_todo": {"type": "integer", "description": "Recent comments returned per todo"},
+                        "days": {"type": "integer", "description": "Comment recency window"}
+                    },
+                    "required": ["project_id"]
+                }
+            },
+            {
+                "name": "prepare_todo_context",
+                "description": "Prepare and cache a compact summary of a Basecamp todo task context. Use when the user asks for a task/todo summary or full context without rereading all comments.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string", "description": "Project ID"},
+                        "todo_id": {"type": "string", "description": "Todo ID"},
+                        "force_refresh": {"type": "boolean", "description": "Rebuild cached context even when comments are unchanged"},
+                        "max_comment_pages": {"type": "integer", "description": "Maximum Basecamp comment pages to fetch"}
+                    },
+                    "required": ["project_id", "todo_id"]
                 }
             },
             {
@@ -899,10 +943,91 @@ class MCPServer:
                 todolist_id = arguments.get("todolist_id")
                 project_id = arguments.get("project_id")
                 todos = client.get_todos(project_id, todolist_id)
+                todos = compact_todos(todos)
                 return {
                     "status": "success",
                     "todos": todos,
                     "count": len(todos)
+                }
+
+            elif tool_name == "get_project_todos":
+                project_id = arguments.get("project_id")
+                status = arguments.get("status", "active")
+                limit = max(1, min(int(arguments.get("limit", 50)), 100))
+                todos = compact_todos(client.get_project_todos(project_id, status, limit))
+                return {
+                    "status": "success",
+                    "project_id": project_id,
+                    "todos": todos,
+                    "count": len(todos)
+                }
+
+            elif tool_name == "get_project_status_update":
+                project_id = arguments.get("project_id")
+                todo_limit = max(1, min(int(arguments.get("todo_limit", 10)), 25))
+                comments_per_todo = max(1, min(int(arguments.get("comments_per_todo", 5)), 10))
+                days = max(1, min(int(arguments.get("days", 7)), 30))
+                todos = compact_todos(client.get_project_todos(project_id, "active", todo_limit))
+                updates = []
+                for todo in todos:
+                    todo_id = str(todo.get("id"))
+                    comment_result = client.get_all_comments(project_id, todo_id)
+                    comments = compact_comments(comment_result.get("comments", []))
+                    selected_comments = select_recent_comments(comments, days, comments_per_todo)
+                    context = load_or_create_summary(project_id, todo_id, comments)
+                    updates.append({
+                        "todo": todo,
+                        "comment_context": {
+                            "summary": context["summary"],
+                            "cached": context["cached"],
+                            "latest_comment_at": context["latest_comment_at"],
+                            "total_fetched_comments": len(comments),
+                            "total_comments": comment_result.get("total_count"),
+                            "has_more_comments": comment_result.get("has_more", False),
+                            "returned_recent_comments": len(selected_comments),
+                        },
+                        "recent_comments": selected_comments,
+                    })
+                return {
+                    "status": "success",
+                    "project_id": project_id,
+                    "todo_count": len(updates),
+                    "days": days,
+                    "updates": updates,
+                }
+
+            elif tool_name == "prepare_todo_context":
+                project_id = arguments.get("project_id")
+                todo_id = arguments.get("todo_id")
+                force_refresh = bool(arguments.get("force_refresh", False))
+                max_comment_pages = max(1, min(int(arguments.get("max_comment_pages", 4)), 10))
+                todo = compact_todo(client.get_todo(project_id, todo_id))
+                comment_result = client.get_all_comments(project_id, todo_id, max_comment_pages)
+                comments = compact_comments(comment_result.get("comments", []))
+                context = load_or_create_summary(
+                    project_id,
+                    todo_id,
+                    comments,
+                    force_refresh=force_refresh,
+                    total_comments=comment_result.get("total_count"),
+                    fetched_comments=len(comments),
+                    has_more_comments=comment_result.get("has_more", False),
+                )
+                return {
+                    "status": "success",
+                    "project_id": project_id,
+                    "todo_id": todo_id,
+                    "todo": todo,
+                    "context": {
+                        "summary": context["summary"],
+                        "cached": context["cached"],
+                        "cache_created_at": context["cache_created_at"],
+                        "cache_updated_at": context["cache_updated_at"],
+                        "latest_comment_at": context["latest_comment_at"],
+                        "total_comments": context["total_comments"],
+                        "total_fetched_comments": context["fetched_comments"],
+                        "has_more_comments": context["has_more_comments"],
+                    },
                 }
 
             elif tool_name == "create_todo":
@@ -931,7 +1056,7 @@ class MCPServer:
                 )
                 return {
                     "status": "success",
-                    "todo": todo,
+                    "todo": compact_todo(todo),
                     "message": f"Todo '{content}' created successfully"
                 }
 
@@ -958,7 +1083,7 @@ class MCPServer:
                 )
                 return {
                     "status": "success",
-                    "todo": todo,
+                    "todo": compact_todo(todo),
                     "message": "Todo updated successfully"
                 }
 
@@ -1000,11 +1125,11 @@ class MCPServer:
                 if project_id:
                     # Search within specific project
                     results["todolists"] = search.search_todolists(query, project_id)
-                    results["todos"] = search.search_todos(query, project_id)
+                    results["todos"] = compact_todos(search.search_todos(query, project_id))
                 else:
                     # Search across all projects
                     results["projects"] = search.search_projects(query)
-                    results["todos"] = search.search_todos(query)
+                    results["todos"] = compact_todos(search.search_todos(query))
                     results["messages"] = search.search_messages(query)
 
                 return {
@@ -1017,6 +1142,8 @@ class MCPServer:
                 query = arguments.get("query")
                 search = BasecampSearch(client=client)
                 results = search.global_search(query)
+                if isinstance(results, dict) and isinstance(results.get("todos"), list):
+                    results["todos"] = compact_todos(results["todos"])
                 return {
                     "status": "success",
                     "query": query,
@@ -1028,10 +1155,11 @@ class MCPServer:
                 project_id = arguments.get("project_id")
                 page = arguments.get("page", 1)
                 result = client.get_comments(project_id, recording_id, page)
+                comments = compact_comments(result["comments"])
                 return {
                     "status": "success",
-                    "comments": result["comments"],
-                    "count": len(result["comments"]),
+                    "comments": comments,
+                    "count": len(comments),
                     "page": page,
                     "total_count": result["total_count"],
                     "next_page": result["next_page"]
@@ -1044,7 +1172,7 @@ class MCPServer:
                 comment = client.create_comment(recording_id, project_id, content)
                 return {
                     "status": "success",
-                    "comment": comment,
+                    "comment": compact_comment(comment),
                     "message": "Comment created successfully"
                 }
 

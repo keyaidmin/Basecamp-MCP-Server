@@ -98,12 +98,25 @@ class BasecampClient:
 
     # Project methods
     def get_projects(self):
-        """Get all projects."""
-        response = self.get('projects.json')
-        if response.status_code == 200:
-            return response.json()
-        else:
-            raise Exception(f"Failed to get projects: {response.status_code} - {response.text}")
+        """Get all projects across every Basecamp API page."""
+        endpoint = 'projects.json'
+        all_projects = []
+        page = 1
+        while True:
+            response = self.get(endpoint, params={"page": page})
+            if response.status_code != 200:
+                raise Exception(f"Failed to get projects: {response.status_code} - {response.text}")
+
+            page_items = response.json() or []
+            all_projects.extend(page_items)
+
+            link_header = response.headers.get("Link", "")
+            has_next = 'rel="next"' in link_header if link_header else False
+            if not page_items or not has_next:
+                break
+            page += 1
+
+        return all_projects
 
     def get_project(self, project_id):
         """Get a specific project by ID."""
@@ -244,6 +257,20 @@ class BasecampClient:
             page += 1
 
         return all_todos
+
+    def get_project_todos(self, project_id, status="active", limit=50):
+        """Get todos in a project, newest updated first."""
+        page_size = 15
+        max_pages = max(1, (int(limit) + page_size - 1) // page_size)
+        todos = self.get_recordings(
+            "Todo",
+            bucket=project_id,
+            status=status,
+            sort="updated_at",
+            direction="desc",
+            max_pages=max_pages,
+        )
+        return todos[:limit]
 
     def get_todo(self, project_id, todo_id):
         """Get a specific todo.
@@ -559,6 +586,49 @@ class BasecampClient:
         if response.status_code == 200:
             return response.json()
         raise Exception(f"Failed to search: {response.status_code} - {response.text}")
+
+    def get_recordings(
+        self,
+        recording_type,
+        bucket=None,
+        status="active",
+        sort="created_at",
+        direction="desc",
+        max_pages=None,
+    ):
+        """Get recordings from Basecamp using server-side type and sort filters."""
+        endpoint = "projects/recordings.json"
+        recordings = []
+        page = 1
+
+        while True:
+            params = {
+                "type": recording_type,
+                "status": status,
+                "sort": sort,
+                "direction": direction,
+                "page": page,
+            }
+            if bucket is not None:
+                params["bucket"] = bucket
+
+            response = self.get(endpoint, params=params)
+            if response.status_code != 200:
+                raise Exception(f"Failed to get recordings: {response.status_code} - {response.text}")
+
+            page_items = response.json() or []
+            recordings.extend(page_items)
+
+            link_header = response.headers.get("Link", "")
+            has_next = 'rel="next"' in link_header if link_header else False
+            if not page_items or not has_next:
+                break
+            if max_pages is not None and page >= max_pages:
+                break
+
+            page += 1
+
+        return recordings
 
     # Campfire (chat) methods
     def get_campfires(self, project_id):
@@ -892,6 +962,25 @@ class BasecampClient:
             }
         else:
             raise Exception(f"Failed to get comments: {response.status_code} - {response.text}")
+
+    def get_all_comments(self, project_id, recording_id, max_pages=4):
+        """Get all fetched comment pages for a recording, capped for predictable IO."""
+        page = 1
+        all_comments = []
+        total_count = None
+
+        while page and page <= max_pages:
+            result = self.get_comments(project_id, recording_id, page)
+            all_comments.extend(result["comments"])
+            total_count = result["total_count"]
+            page = result["next_page"]
+
+        return {
+            "comments": all_comments,
+            "total_count": total_count,
+            "fetched_count": len(all_comments),
+            "has_more": bool(page),
+        }
 
     def create_comment(self, recording_id, bucket_id, content):
         """

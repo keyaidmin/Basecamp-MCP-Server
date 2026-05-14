@@ -33,6 +33,7 @@ logs/
 oauth_tokens.json
 .env
 .flaskenv
+*.sqlite3
 
 # macOS
 .DS_Store

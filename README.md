@@ -240,8 +240,11 @@ Once configured, you can use these tools in Cursor:
 - `create_todolist` - Create a new todo list in a project
 - `update_todolist` - Update an existing todo list (name and/or description)
 - `trash_todolist` - Move a todo list to the trash (recoverable within 30 days)
-- `get_todos` - Get todos from a todo list (returns all pages; handles Basecamp pagination transparently)
-- `get_todo` - Get a single todo item by its ID
+- `get_todos` - Get compact todos from a todo list (returns all pages; handles Basecamp pagination transparently)
+- `get_project_todos` - Get compact todos inside a project, newest updated first
+- `get_project_status_update` - Get compact project status from recent updated todos and their recent comments
+- `prepare_todo_context` - Prepare and cache a compact summary of a todo task context for user summary requests
+- `get_todo` - Get compact context for a single todo item by its ID
 - `reposition_todo` - Reposition a todo within its list, or move it to another list or group
 - `archive_todo` - Archive a todo item (hidden from active list, accessible via web UI)
 - `search_basecamp` - Search across projects, todos, and messages

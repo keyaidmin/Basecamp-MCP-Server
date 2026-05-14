@@ -709,6 +709,58 @@ class BasecampSearch:
             logger.error(f"Error in search_recordings_api: {str(e)}")
             raise
 
+    def _recording_matches_query(self, recording, query):
+        if not query:
+            return True
+
+        q = query.lower()
+        fields = [
+            recording.get("content"),
+            recording.get("plain_text_content"),
+            recording.get("description"),
+            recording.get("plain_text_description"),
+            recording.get("title"),
+            recording.get("name"),
+        ]
+        for nested_field in ("bucket", "parent", "creator"):
+            nested = recording.get(nested_field)
+            if isinstance(nested, dict):
+                fields.extend([
+                    nested.get("name"),
+                    nested.get("title"),
+                    nested.get("email_address"),
+                ])
+
+        return any(q in str(value).lower() for value in fields if value)
+
+    def search_latest_updated_todos(
+        self,
+        query=None,
+        bucket_id=None,
+        max_results=10,
+        max_pages=3,
+    ):
+        """Search active todos from the recordings API, newest updated first."""
+        try:
+            todos = self.client.get_recordings(
+                "Todo",
+                bucket=bucket_id,
+                status="active",
+                sort="updated_at",
+                direction="desc",
+                max_pages=max_pages,
+            )
+        except Exception as e:
+            logger.warning(f"search_latest_updated_todos failed: {e}")
+            return []
+
+        matching_todos = [
+            todo for todo in todos
+            if self._recording_matches_query(todo, query)
+        ]
+        matching_todos.sort(key=lambda todo: todo.get("updated_at") or "", reverse=True)
+        return matching_todos[:max_results]
+
     def search_recordings_api_todos_and_comments(
         self,
         query,
@@ -716,14 +768,26 @@ class BasecampSearch:
         max_results=10,
     ):
         """
-        Default search restricted to To-dos and Comments (recording_search_types Todo, Comment).
-        Runs two API calls and merges results (todos first, then comments), dedupes by id, returns up to max_results.
+        Default search restricted to To-dos and Comments.
+        To-dos are pulled from recordings sorted by updated_at before falling back to relevance search.
         """
         seen = set()
         out = []
+
+        latest_todos = self.search_latest_updated_todos(
+            query=query,
+            bucket_id=bucket_id,
+            max_results=max_results,
+        )
+        for todo in latest_todos:
+            rid = ("Todo", todo.get("id"))
+            if rid not in seen:
+                seen.add(rid)
+                out.append(todo)
+                if len(out) >= max_results:
+                    return out[:max_results]
+
         for rec_type in ("Todo", "Comment"):
-            if len(out) >= max_results:
-                break
             try:
                 page = self.search_recordings_api(
                     query,
@@ -733,7 +797,7 @@ class BasecampSearch:
                 )
                 if isinstance(page, list):
                     for r in page:
-                        rid = r.get("id")
+                        rid = (r.get("type"), r.get("id"))
                         if rid not in seen:
                             seen.add(rid)
                             out.append(r)
@@ -741,6 +805,8 @@ class BasecampSearch:
                                 break
             except Exception as e:
                 logger.warning(f"search_recordings_api type={rec_type} failed: {e}")
+            if len(out) >= max_results:
+                break
         return out[:max_results]
 
     def search_recordings_in_project(self, project_id: int, query: str, max_results: int = 10):

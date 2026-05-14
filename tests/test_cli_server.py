@@ -2,6 +2,7 @@
 """Tests for the CLI MCP server."""
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -176,7 +177,7 @@ def test_cli_server_tool_call_no_auth(mock_get_token):
             proc.terminate()
 
 @patch.object(token_storage, 'get_token')
-def test_cli_server_global_search_call_no_auth(mock_get_token):
+def test_cli_server_global_search_call_no_auth(mock_get_token, tmp_path):
     """Test global search tool call without authentication."""
     init_request = {
         "jsonrpc": "2.0",
@@ -200,7 +201,11 @@ def test_cli_server_global_search_call_no_auth(mock_get_token):
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True
+        text=True,
+        env={
+            **os.environ,
+            "BASECAMP_TOKEN_FILE": str(tmp_path / "missing_oauth_tokens.json"),
+        },
     )
 
     try:
