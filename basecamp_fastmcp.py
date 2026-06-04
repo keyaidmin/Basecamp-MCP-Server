@@ -84,6 +84,12 @@ mcp = FastMCP(
 )
 
 
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request: Request):
+    """Report that the FastMCP HTTP server is running."""
+    return JSONResponse({"status": "ok"})
+
+
 @mcp.custom_route("/basecamp/oauth/callback", methods=["GET"])
 async def basecamp_oauth_callback(request: Request):
     """Complete the delegated Basecamp OAuth flow for MCP authorization."""

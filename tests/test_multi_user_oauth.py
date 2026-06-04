@@ -8,6 +8,7 @@ from basecamp_mcp_oauth import BasecampMcpOAuthProvider
 from mcp.server.auth.provider import AuthorizationParams
 from mcp.shared.auth import OAuthClientInformationFull
 import oauth_store
+from starlette.testclient import TestClient
 
 
 @pytest.fixture(autouse=True)
@@ -51,6 +52,15 @@ def auth_params() -> AuthorizationParams:
         redirect_uri_provided_explicitly=True,
         resource="http://localhost:8051/mcp",
     )
+
+
+def test_health_route_reports_ok():
+    client = TestClient(basecamp_fastmcp.mcp.streamable_http_app())
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
 
 
 class FakeBasecampOAuth:
