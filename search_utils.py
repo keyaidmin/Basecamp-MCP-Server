@@ -733,6 +733,168 @@ class BasecampSearch:
 
         return any(q in str(value).lower() for value in fields if value)
 
+    def _recording_matches_type(self, recording, recording_type):
+        if not recording_type:
+            return True
+        return recording.get("type") == recording_type
+
+    def _recording_matches_bucket(self, recording, bucket_id):
+        if bucket_id is None:
+            return True
+
+        bucket = recording.get("bucket")
+        if isinstance(bucket, dict) and str(bucket.get("id")) == str(bucket_id):
+            return True
+
+        project = recording.get("project")
+        if isinstance(project, dict) and str(project.get("id")) == str(bucket_id):
+            return True
+
+        return False
+
+    def _todo_to_recording(self, todo, project=None):
+        project_id = None
+        project_name = ""
+
+        bucket = todo.get("bucket")
+        if isinstance(bucket, dict):
+            project_id = bucket.get("id")
+            project_name = bucket.get("name") or ""
+
+        project_ref = todo.get("project")
+        if isinstance(project_ref, dict):
+            project_id = project_id or project_ref.get("id")
+            project_name = project_name or project_ref.get("name") or ""
+
+        if project:
+            project_id = project_id or project.get("id")
+            project_name = project_name or project.get("name") or ""
+
+        account_id = getattr(self.client, "account_id", None) or ""
+        todo_id = todo.get("id")
+        app_url = todo.get("app_url")
+        if not app_url and account_id and project_id and todo_id:
+            app_url = f"https://3.basecamp.com/{account_id}/buckets/{project_id}/todos/{todo_id}"
+
+        return {
+            **todo,
+            "id": todo_id,
+            "type": todo.get("type", "Todo"),
+            "title": todo.get("title") or todo.get("content") or todo.get("name") or "",
+            "name": todo.get("name") or todo.get("content") or todo.get("title") or "",
+            "bucket": {"id": project_id, "name": project_name, "type": "Project"},
+            "app_url": app_url,
+            "status": todo.get("status") or ("completed" if todo.get("completed") else "active"),
+        }
+
+    def _dedupe_recordings(self, recordings):
+        seen = set()
+        out = []
+        for recording in recordings:
+            rid = (recording.get("type"), recording.get("id"))
+            if rid in seen:
+                continue
+            seen.add(rid)
+            out.append(recording)
+        return out
+
+    def _sort_recordings_by_updated_at(self, recordings):
+        return sorted(
+            recordings,
+            key=lambda recording: (
+                recording.get("updated_at")
+                or recording.get("created_at")
+                or ""
+            ),
+            reverse=True,
+        )
+
+    def search_project_todo_recordings(
+        self,
+        project,
+        query,
+        max_results=10,
+        todo_limit=100,
+    ):
+        """Search one project's todos client-side after fetching project-scoped todos."""
+        project_id = project["id"] if isinstance(project, dict) else project
+        try:
+            todos = self.client.get_project_todos(project_id, limit=todo_limit)
+        except Exception as e:
+            logger.warning(f"get_project_todos failed for project {project_id}: {e}")
+            todos = self.search_todos(
+                query=None,
+                project_id=project_id,
+                include_completed=True,
+            )
+
+        matches = [
+            self._todo_to_recording(todo, project if isinstance(project, dict) else None)
+            for todo in todos
+            if self._recording_matches_query(todo, query)
+        ]
+        return self._sort_recordings_by_updated_at(
+            self._dedupe_recordings(matches)
+        )[:max_results]
+
+    def search_project_scoped_todos(
+        self,
+        query,
+        bucket_id=None,
+        max_results=10,
+        max_projects=50,
+        per_project_todo_limit=100,
+    ):
+        """
+        Search todos by fetching project-scoped todo feeds and filtering locally.
+        This avoids Basecamp search index false positives and query-ignoring results.
+        """
+        if bucket_id is not None:
+            try:
+                project = self.client.get_project(bucket_id)
+            except Exception:
+                project = {"id": bucket_id, "name": ""}
+            return self.search_project_todo_recordings(
+                project,
+                query,
+                max_results=max_results,
+                todo_limit=per_project_todo_limit,
+            )
+
+        try:
+            projects = self.client.get_projects()
+        except Exception as e:
+            logger.warning(f"search_project_scoped_todos could not list projects: {e}")
+            return []
+
+        projects = sorted(
+            projects,
+            key=lambda project: project.get("updated_at") or "",
+            reverse=True,
+        )[:max_projects]
+
+        matches = []
+        for project in projects:
+            dock = project.get("dock") or []
+            has_todos = any(
+                item.get("name") == "todoset" and item.get("enabled", True)
+                for item in dock
+            )
+            if dock and not has_todos:
+                continue
+
+            project_matches = self.search_project_todo_recordings(
+                project,
+                query,
+                max_results=max_results,
+                todo_limit=per_project_todo_limit,
+            )
+            matches.extend(project_matches)
+
+        return self._sort_recordings_by_updated_at(
+            self._dedupe_recordings(matches)
+        )[:max_results]
+
     def search_latest_updated_todos(
         self,
         query=None,
@@ -768,11 +930,25 @@ class BasecampSearch:
         max_results=10,
     ):
         """
-        Default search restricted to To-dos and Comments.
-        To-dos are pulled from recordings sorted by updated_at before falling back to relevance search.
+        Default search restricted to verified To-dos and Comments.
+        Project-scoped todo feeds are searched first because Basecamp's search
+        endpoint can return recency-sorted false positives for some queries.
         """
         seen = set()
         out = []
+
+        project_scoped_todos = self.search_project_scoped_todos(
+            query=query,
+            bucket_id=bucket_id,
+            max_results=max_results,
+        )
+        for todo in project_scoped_todos:
+            rid = ("Todo", todo.get("id"))
+            if rid not in seen:
+                seen.add(rid)
+                out.append(todo)
+                if len(out) >= max_results:
+                    return out[:max_results]
 
         latest_todos = self.search_latest_updated_todos(
             query=query,
@@ -797,6 +973,12 @@ class BasecampSearch:
                 )
                 if isinstance(page, list):
                     for r in page:
+                        if not self._recording_matches_query(r, query):
+                            continue
+                        if not self._recording_matches_type(r, rec_type):
+                            continue
+                        if not self._recording_matches_bucket(r, bucket_id):
+                            continue
                         rid = (r.get("type"), r.get("id"))
                         if rid not in seen:
                             seen.add(rid)
@@ -815,30 +997,8 @@ class BasecampSearch:
         does not return expected items (Basecamp index can omit or rank them low).
         Returns recording-like dicts (id, type, title, bucket, app_url) for consistency with API.
         """
-        try:
-            project = self.client.get_project(project_id)
-            account_id = getattr(self.client, "account_id", None) or ""
-            todos = self.search_todos(query=query, project_id=project_id, include_completed=False)
-            seen = set()
-            out = []
-            for t in todos:
-                if len(out) >= max_results:
-                    break
-                rid = t.get("id")
-                if rid in seen:
-                    continue
-                seen.add(rid)
-                app_url = f"https://3.basecamp.com/{account_id}/buckets/{project_id}/todos/{rid}"
-                out.append({
-                    "id": rid,
-                    "type": "Todo",
-                    "title": t.get("content") or t.get("name") or "",
-                    "name": t.get("content") or t.get("name") or "",
-                    "bucket": {"id": project_id, "name": project.get("name", ""), "type": "Project"},
-                    "app_url": app_url,
-                    "status": "active" if not t.get("completed") else "completed",
-                })
-            return out
-        except Exception as e:
-            logger.warning(f"search_recordings_in_project failed: {e}")
-            return []
+        return self.search_project_scoped_todos(
+            query=query,
+            bucket_id=project_id,
+            max_results=max_results,
+        )

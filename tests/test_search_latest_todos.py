@@ -129,6 +129,105 @@ def test_search_todos_prioritizes_latest_updated_recordings_before_search_api():
     ]
 
 
+def test_project_scoped_search_filters_unrelated_official_search_results():
+    class FakeClient:
+        account_id = "12345"
+
+        def get_project(self, project_id):
+            assert project_id == "999"
+            return {"id": "999", "name": "Automation Project"}
+
+        def get_project_todos(self, project_id, limit=100):
+            assert project_id == "999"
+            return [
+                {
+                    "id": 10,
+                    "type": "Todo",
+                    "content": "Automation task",
+                    "description": "Build offboarding automation",
+                    "updated_at": "2026-05-20T12:00:00Z",
+                },
+                {
+                    "id": 11,
+                    "type": "Todo",
+                    "content": "Lunch order",
+                    "description": "Unrelated",
+                    "updated_at": "2026-05-21T12:00:00Z",
+                },
+            ]
+
+        def get_recordings(self, recording_type, **kwargs):
+            assert recording_type == "Todo"
+            return [{"id": 12, "type": "Todo", "content": "Unrelated recent task"}]
+
+        def search_recordings(self, **kwargs):
+            return [{"id": 13, "type": "Todo", "content": "Unrelated API result"}]
+
+    results = BasecampSearch(client=FakeClient()).search_recordings_api_todos_and_comments(
+        "automation",
+        bucket_id="999",
+        max_results=10,
+    )
+
+    assert [(result["type"], result["id"]) for result in results] == [("Todo", 10)]
+
+
+def test_global_project_scoped_search_scans_projects_and_sorts_matches():
+    class FakeClient:
+        account_id = "12345"
+
+        def get_projects(self):
+            return [
+                {
+                    "id": "1",
+                    "name": "Older Project",
+                    "updated_at": "2026-05-20T12:00:00Z",
+                    "dock": [{"name": "todoset", "enabled": True}],
+                },
+                {
+                    "id": "2",
+                    "name": "Newer Project",
+                    "updated_at": "2026-05-21T12:00:00Z",
+                    "dock": [{"name": "todoset", "enabled": True}],
+                },
+            ]
+
+        def get_project_todos(self, project_id, limit=100):
+            if project_id == "1":
+                return [
+                    {
+                        "id": 1,
+                        "type": "Todo",
+                        "content": "Automation roadmap",
+                        "updated_at": "2026-05-20T12:00:00Z",
+                    }
+                ]
+            return [
+                {
+                    "id": 2,
+                    "type": "Todo",
+                    "content": "AI automation briefing",
+                    "updated_at": "2026-05-22T12:00:00Z",
+                },
+                {
+                    "id": 3,
+                    "type": "Todo",
+                    "content": "Unrelated",
+                    "updated_at": "2026-05-23T12:00:00Z",
+                },
+            ]
+
+    results = BasecampSearch(client=FakeClient()).search_project_scoped_todos(
+        "automation",
+        max_results=10,
+    )
+
+    assert [(result["type"], result["id"]) for result in results] == [
+        ("Todo", 2),
+        ("Todo", 1),
+    ]
+
+
 @pytest.mark.anyio
 async def test_global_search_returns_latest_updated_todos_first(monkeypatch):
     class FakeClient:

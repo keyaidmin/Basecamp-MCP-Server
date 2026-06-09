@@ -214,7 +214,7 @@ async def get_project(project_id: str) -> Dict[str, Any]:
 
 @mcp.tool()
 async def search_basecamp(query: str, project_id: Optional[str] = None) -> Dict[str, Any]:
-    """Search Basecamp for To-dos and Comments (relevance-ordered). Returns top 10 results. Uses official API with type=Todo and type=Comment. When project_id is set, also runs client-side search in that project so items missed by the API can still be found.
+    """Search Basecamp todos/comments by keyword. Todo matches are verified by fetching project-scoped todo feeds and filtering locally before using the official search API as a fallback.
     
     Args:
         query: Search query (e.g. 'CV recognition', task name, keyword)
@@ -233,19 +233,6 @@ async def search_basecamp(query: str, project_id: Optional[str] = None) -> Dict[
         )
         if isinstance(recordings, list):
             recordings = compact_todos(recordings[:10])
-        # When project_id is set, merge with client-side search in that project (API can miss some todos)
-        if project_id and isinstance(recordings, list):
-            fallback = await _run_sync(
-                lambda: search.search_recordings_in_project(bucket_id, query, max_results=10)
-            )
-            if fallback:
-                fallback = compact_todos(fallback)
-                seen = {r.get("id") for r in recordings}
-                for r in fallback:
-                    if r.get("id") not in seen and len(recordings) < 10:
-                        recordings.append(r)
-                        seen.add(r.get("id"))
-                recordings = recordings[:10]
         count = len(recordings) if isinstance(recordings, list) else 0
         # Group by type for clients that expect projects/todos/messages (top 3 relevance-ranked)
         results = {"recordings": recordings, "count": count}
@@ -811,7 +798,7 @@ async def reposition_todo(
 
 @mcp.tool()
 async def global_search(query: str) -> Dict[str, Any]:
-    """Search Basecamp for To-dos and Comments only (relevance-ordered). Returns top 10 results. Uses official API with type=Todo and type=Comment.
+    """Search Basecamp todos/comments by keyword across projects. Todo matches are verified by fetching project-scoped todo feeds and filtering locally.
     
     Args:
         query: Search query (e.g. 'CV recognition', task name, or keyword)
@@ -874,7 +861,7 @@ async def search_recordings(
     page: int = 1,
     per_page: int = 10,
 ) -> Dict[str, Any]:
-    """Search across all Basecamp content using the official API (relevance-ordered).
+    """Search across Basecamp content. Todo searches use verified project-scoped todo feeds; other types use the official API with local query/type filtering.
     Returns at most 10 recordings (to-dos, messages, cards, documents, comments, etc.).
     Use get_search_metadata to see valid type/file_type filter values (e.g. Todo, Message, Kanban::Card).
     
@@ -894,20 +881,35 @@ async def search_recordings(
     try:
         search = BasecampSearch(client=client)
         limit = min(per_page, 10)  # cap at 10
-        results = await _run_sync(
-            lambda: search.search_recordings_api(
-                query,
-                type=type,
-                bucket_id=int(bucket_id) if bucket_id else None,
-                creator_id=int(creator_id) if creator_id else None,
-                file_type=file_type,
-                exclude_chat=exclude_chat,
-                page=page,
-                per_page=limit,
+        parsed_bucket_id = int(bucket_id) if bucket_id else None
+        if type == "Todo":
+            results = await _run_sync(
+                lambda: search.search_project_scoped_todos(
+                    query,
+                    bucket_id=parsed_bucket_id,
+                    max_results=limit,
+                )
             )
-        )
+        else:
+            results = await _run_sync(
+                lambda: search.search_recordings_api(
+                    query,
+                    type=type,
+                    bucket_id=parsed_bucket_id,
+                    creator_id=int(creator_id) if creator_id else None,
+                    file_type=file_type,
+                    exclude_chat=exclude_chat,
+                    page=page,
+                    per_page=limit,
+                )
+            )
         if isinstance(results, list):
-            results = results[:10]
+            results = [
+                result for result in results
+                if search._recording_matches_query(result, query)
+                and search._recording_matches_type(result, type)
+                and search._recording_matches_bucket(result, parsed_bucket_id)
+            ][:10]
             if type == "Todo":
                 results = compact_todos(results)
         return {
