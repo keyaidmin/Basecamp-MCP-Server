@@ -10,13 +10,14 @@ import logging
 import os
 import sys
 import hmac
+import html
 from typing import Any, Dict, List, Optional
 import anyio
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from starlette.requests import Request
-from starlette.responses import JSONResponse, RedirectResponse
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 # Import existing business logic
 from basecamp_client import BasecampClient
@@ -52,6 +53,7 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger('basecamp_fastmcp')
+SERVICE_OAUTH_BROWSER_USER_EMAIL = "aibot@key.study"
 
 if os.getenv("ALLOW_INSECURE_OAUTH", "").lower() in {"1", "true", "yes"}:
     import mcp.server.auth.routes as auth_routes
@@ -185,6 +187,65 @@ def _service_basecamp_client() -> BasecampClient | None:
     )
 
 
+def _service_auth_url_payload() -> dict[str, Any]:
+    configured_user_id = os.getenv("BASECAMP_MCP_AUTH_USER_ID", "").strip()
+    account_id = _service_account_id()
+    if not configured_user_id and not account_id:
+        raise ValueError("BASECAMP_MCP_AUTH_USER_ID or BASECAMP_MCP_AUTH_ACCOUNT_ID is required.")
+
+    authorization_url = create_service_reconnect_authorization_url(
+        user_id=configured_user_id or None,
+        account_id=account_id or None,
+    )
+    return {
+        "status": "success",
+        "authorization_url": authorization_url,
+        "service_user_id": configured_user_id or None,
+        "resolved_user_id": _service_user_id() or None,
+        "service_account_id": account_id or None,
+        "required_browser_user": SERVICE_OAUTH_BROWSER_USER_EMAIL,
+        "callback_url": os.getenv("BASECAMP_REDIRECT_URI") or f"{public_base_url()}/basecamp/oauth/callback",
+        "instructions": (
+            f"Open authorization_url in a browser where {SERVICE_OAUTH_BROWSER_USER_EMAIL} "
+            "is logged into Basecamp and has access to the configured account."
+        ),
+    }
+
+
+def _oauth_result_page(title: str, message: str, status_code: int = 200, details: str | None = None) -> HTMLResponse:
+    escaped_title = html.escape(title)
+    escaped_message = html.escape(message)
+    escaped_details = html.escape(details or "")
+    detail_html = f"<pre>{escaped_details}</pre>" if details else ""
+    return HTMLResponse(
+        f"""<!doctype html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <title>{escaped_title}</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; background: #f6f7f9; color: #17202a; }}
+    main {{ max-width: 720px; margin: 10vh auto; padding: 32px; background: white; border: 1px solid #d9dee7; border-radius: 8px; }}
+    h1 {{ font-size: 24px; margin: 0 0 16px; }}
+    p {{ line-height: 1.55; }}
+    code {{ background: #eef1f5; padding: 2px 5px; border-radius: 4px; }}
+    pre {{ white-space: pre-wrap; background: #f0f2f5; padding: 12px; border-radius: 6px; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{escaped_title}</h1>
+    <p>{escaped_message}</p>
+    <p>For service access recovery, open the OAuth URL in a browser where <code>{SERVICE_OAUTH_BROWSER_USER_EMAIL}</code> is logged into Basecamp and has access to account <code>{html.escape(_service_account_id() or "configured account")}</code>.</p>
+    {detail_html}
+  </main>
+</body>
+</html>""",
+        status_code=status_code,
+    )
+
+
 @mcp.custom_route("/basecamp/api/auth/status", methods=["GET"])
 async def service_basecamp_auth_status(request: Request):
     """Report Basecamp OAuth state for the service-token-bound user."""
@@ -200,36 +261,13 @@ async def service_basecamp_auth_url(request: Request):
     if not _is_service_api_request(request):
         return _service_api_unauthorized_response()
 
-    configured_user_id = os.getenv("BASECAMP_MCP_AUTH_USER_ID", "").strip()
-    account_id = _service_account_id()
-    if not configured_user_id and not account_id:
-        return JSONResponse(
-            {
-                "error": "Missing configuration",
-                "message": "BASECAMP_MCP_AUTH_USER_ID or BASECAMP_MCP_AUTH_ACCOUNT_ID is required.",
-            },
-            status_code=500,
-        )
-
     try:
-        authorization_url = create_service_reconnect_authorization_url(
-            user_id=configured_user_id or None,
-            account_id=account_id or None,
-        )
+        payload = _service_auth_url_payload()
     except Exception as exc:
         logger.exception("Failed to create Basecamp service reconnect URL")
         return JSONResponse({"error": "Authorization URL error", "message": str(exc)}, status_code=500)
 
-    return JSONResponse(
-        {
-            "status": "success",
-            "authorization_url": authorization_url,
-            "service_user_id": configured_user_id or None,
-            "resolved_user_id": _service_user_id() or None,
-            "service_account_id": account_id or None,
-            "callback_url": os.getenv("BASECAMP_REDIRECT_URI") or f"{public_base_url()}/basecamp/oauth/callback",
-        }
-    )
+    return JSONResponse(payload)
 
 
 @mcp.custom_route("/basecamp/api/webhooks/register-url", methods=["GET"])
@@ -310,19 +348,38 @@ async def basecamp_oauth_callback(request: Request):
     """Complete the delegated Basecamp OAuth flow for MCP authorization."""
     error = request.query_params.get("error")
     if error:
-        return JSONResponse({"error": error}, status_code=400)
+        return _oauth_result_page(
+            "Basecamp OAuth Failed",
+            "Basecamp rejected the authorization request.",
+            status_code=400,
+            details=error,
+        )
 
     state = request.query_params.get("state")
     code = request.query_params.get("code")
     if not state or not code:
-        return JSONResponse({"error": "Missing OAuth state or code"}, status_code=400)
+        return _oauth_result_page(
+            "Basecamp OAuth Failed",
+            "The callback was missing an OAuth state or code. Generate a new recovery URL from the MCP tool and try again.",
+            status_code=400,
+        )
 
     try:
         redirect_url = await oauth_provider.complete_basecamp_authorization(state, code)
+        if redirect_url == f"{public_base_url()}/health":
+            return _oauth_result_page(
+                "Basecamp OAuth Reconnected",
+                "The MCP service account authorization was refreshed successfully. API clients can retry their Basecamp request now.",
+            )
         return RedirectResponse(redirect_url, status_code=302)
     except Exception as exc:
         logger.exception("Basecamp OAuth callback failed")
-        return JSONResponse({"error": "OAuth callback failed", "message": str(exc)}, status_code=400)
+        return _oauth_result_page(
+            "Basecamp OAuth Failed",
+            "The OAuth callback could not refresh the MCP service account authorization.",
+            status_code=400,
+            details=str(exc),
+        )
 
 # Auth helper functions (reused from original server)
 def _get_basecamp_client() -> Optional[BasecampClient]:
@@ -343,6 +400,26 @@ async def _run_sync(func, *args, **kwargs):
 async def get_auth_status() -> Dict[str, Any]:
     """Get authentication status for the current Basecamp MCP user."""
     return {"status": "success", "auth": request_auth.auth_status()}
+
+
+@mcp.tool()
+async def get_basecamp_service_auth_status(refresh: bool = True) -> Dict[str, Any]:
+    """Get Basecamp service-account OAuth status for API clients.
+
+    Args:
+        refresh: Try refreshing Basecamp OAuth before returning status.
+    """
+    return _basecamp_auth_status_payload(refresh=refresh)
+
+
+@mcp.tool()
+async def get_basecamp_auth_recovery_url() -> Dict[str, Any]:
+    """Get a browser OAuth URL to recover Basecamp service-account access.
+
+    Open the returned authorization_url in a browser where aibot@key.study is
+    logged into Basecamp and has access to the configured service account.
+    """
+    return _service_auth_url_payload()
 
 
 @mcp.tool()

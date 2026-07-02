@@ -136,6 +136,8 @@ def test_service_auth_url_route_can_be_account_bound(monkeypatch):
     body = response.json()
     assert body["service_user_id"] is None
     assert body["service_account_id"] == "111"
+    assert body["required_browser_user"] == "aibot@key.study"
+    assert "aibot@key.study" in body["instructions"]
     assert "state=" in body["authorization_url"]
 
 
@@ -156,6 +158,32 @@ def test_account_bound_auth_url_does_not_pin_resolved_user(monkeypatch):
     assert pending["auth_params"] == {"mode": "service_reconnect", "account_id": "111"}
     assert body["service_user_id"] is None
     assert body["resolved_user_id"] == "previous-account-user"
+
+
+@pytest.mark.anyio
+async def test_basecamp_auth_recovery_tool_returns_browser_instructions(monkeypatch):
+    monkeypatch.setenv("BASECAMP_MCP_AUTH_TOKEN", "permanent-service-token")
+    monkeypatch.delenv("BASECAMP_MCP_AUTH_USER_ID", raising=False)
+    monkeypatch.setenv("BASECAMP_MCP_AUTH_ACCOUNT_ID", "111")
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://ai.services.key.study/mcp/bc")
+
+    result = await basecamp_fastmcp.get_basecamp_auth_recovery_url()
+
+    assert result["service_user_id"] is None
+    assert result["service_account_id"] == "111"
+    assert result["required_browser_user"] == "aibot@key.study"
+    assert "authorization_url" in result
+
+
+def test_oauth_callback_error_renders_recovery_html():
+    client = TestClient(basecamp_fastmcp.mcp.streamable_http_app())
+
+    response = client.get("/basecamp/oauth/callback?error=access_denied")
+
+    assert response.status_code == 400
+    assert "text/html" in response.headers["content-type"]
+    assert "Basecamp OAuth Failed" in response.text
+    assert "aibot@key.study" in response.text
 
 
 @pytest.mark.anyio
