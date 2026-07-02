@@ -135,6 +135,34 @@ def _oauth_token_for(user_id: str, client_id: str, scopes: list[str], resource: 
     )
 
 
+def _store_basecamp_authorization(token_data: dict[str, Any], required_user_id: str | None = None) -> str:
+    basecamp_access_token = token_data.get("access_token")
+    if not basecamp_access_token:
+        raise ValueError("Basecamp did not return an access token")
+
+    oauth = BasecampOAuth(redirect_uri=basecamp_redirect_uri())
+    identity = oauth.get_identity(basecamp_access_token)
+    accounts = _bc3_accounts(identity)
+    active_account_id = choose_active_account(identity)
+    if not active_account_id:
+        raise ValueError("Authenticated Basecamp user does not have access to the configured account")
+
+    user_id = extract_user_id(identity, basecamp_access_token)
+    if required_user_id and user_id != required_user_id:
+        raise ValueError("Authenticated Basecamp user does not match the configured service user")
+
+    oauth_store.save_basecamp_user(
+        user_id=user_id,
+        identity=identity,
+        accounts=accounts,
+        active_account_id=active_account_id,
+        access_token=basecamp_access_token,
+        refresh_token=token_data.get("refresh_token"),
+        expires_at=_expires_at(token_data.get("expires_in")),
+    )
+    return user_id
+
+
 def _configured_service_token(token: str) -> BasecampAccessToken | None:
     configured_token = os.getenv("BASECAMP_MCP_AUTH_TOKEN", "").strip()
     user_id = os.getenv("BASECAMP_MCP_AUTH_USER_ID", "").strip()
@@ -150,6 +178,19 @@ def _configured_service_token(token: str) -> BasecampAccessToken | None:
         expires_at=None,
         resource=os.getenv("PUBLIC_MCP_URL") or None,
     )
+
+
+def create_service_reconnect_authorization_url(user_id: str) -> str:
+    """Create a browser URL that refreshes Basecamp OAuth for the service user."""
+    state = secrets.token_urlsafe(32)
+    oauth_store.save_state(
+        state,
+        SERVICE_TOKEN_CLIENT_ID,
+        {"mode": "service_reconnect", "user_id": user_id},
+        oauth_store.now() + PENDING_STATE_TTL_SECONDS,
+    )
+    oauth = BasecampOAuth(redirect_uri=basecamp_redirect_uri())
+    return oauth.get_authorization_url(state=state, scope=os.getenv("BASECAMP_OAUTH_SCOPE"))
 
 
 class BasecampMcpOAuthProvider(
@@ -208,28 +249,13 @@ class BasecampMcpOAuthProvider(
 
         oauth = BasecampOAuth(redirect_uri=basecamp_redirect_uri())
         token_data = oauth.exchange_code_for_token(code)
-        basecamp_access_token = token_data.get("access_token")
-        if not basecamp_access_token:
-            raise ValueError("Basecamp did not return an access token")
-
-        identity = oauth.get_identity(basecamp_access_token)
-        accounts = _bc3_accounts(identity)
-        active_account_id = choose_active_account(identity)
-        if not active_account_id:
-            raise ValueError("Authenticated Basecamp user does not have access to the configured account")
-
-        user_id = extract_user_id(identity, basecamp_access_token)
-        oauth_store.save_basecamp_user(
-            user_id=user_id,
-            identity=identity,
-            accounts=accounts,
-            active_account_id=active_account_id,
-            access_token=basecamp_access_token,
-            refresh_token=token_data.get("refresh_token"),
-            expires_at=_expires_at(token_data.get("expires_in")),
-        )
-
         auth_params = pending["auth_params"]
+        if auth_params.get("mode") == "service_reconnect":
+            _store_basecamp_authorization(token_data, required_user_id=auth_params.get("user_id"))
+            return f"{public_base_url()}/health"
+
+        user_id = _store_basecamp_authorization(token_data)
+
         mcp_code = secrets.token_urlsafe(32)
         oauth_store.save_auth_code(
             mcp_code,

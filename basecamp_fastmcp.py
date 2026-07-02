@@ -9,6 +9,7 @@ Anthropic FastMCP framework, replacing the custom JSON-RPC implementation.
 import logging
 import os
 import sys
+import hmac
 from typing import Any, Dict, List, Optional
 import anyio
 import httpx
@@ -26,7 +27,13 @@ from status_update import select_recent_comments
 import token_storage
 import auth_manager
 import request_auth
-from basecamp_mcp_oauth import BasecampMcpOAuthProvider, MCP_SCOPE, public_base_url
+import oauth_store
+from basecamp_mcp_oauth import (
+    BasecampMcpOAuthProvider,
+    MCP_SCOPE,
+    create_service_reconnect_authorization_url,
+    public_base_url,
+)
 from dotenv import load_dotenv
 
 # Determine project root (directory containing this script)
@@ -88,6 +95,195 @@ mcp = FastMCP(
 async def health_check(request: Request):
     """Report that the FastMCP HTTP server is running."""
     return JSONResponse({"status": "ok"})
+
+
+def _service_token_from_request(request: Request) -> str:
+    authorization = request.headers.get("authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer":
+        return ""
+    return token.strip()
+
+
+def _is_service_api_request(request: Request) -> bool:
+    configured_token = os.getenv("BASECAMP_MCP_AUTH_TOKEN", "").strip()
+    token = _service_token_from_request(request)
+    return bool(configured_token and token and hmac.compare_digest(token, configured_token))
+
+
+def _service_user_id() -> str:
+    return os.getenv("BASECAMP_MCP_AUTH_USER_ID", "").strip()
+
+
+def _service_api_unauthorized_response() -> JSONResponse:
+    return JSONResponse(
+        {"error": "Unauthorized", "message": "Valid BASECAMP_MCP_AUTH_TOKEN bearer token required."},
+        status_code=401,
+    )
+
+
+def _service_basecamp_user() -> dict[str, Any] | None:
+    user_id = _service_user_id()
+    return oauth_store.get_basecamp_user(user_id) if user_id else None
+
+
+def _basecamp_auth_status_payload(refresh: bool = False) -> dict[str, Any]:
+    user_id = _service_user_id()
+    user = oauth_store.get_basecamp_user(user_id) if user_id else None
+    refresh_error = None
+    if refresh and user and request_auth._is_basecamp_token_expired(user):
+        try:
+            user = request_auth._refresh_basecamp_user(user)
+        except Exception as exc:
+            logger.warning("Service Basecamp OAuth refresh failed for user %s: %s", user_id, exc)
+            refresh_error = str(exc)
+
+    expires_at = user.get("expires_at") if user else None
+    expired = bool(expires_at and int(expires_at) <= oauth_store.now())
+    expires_soon = bool(expires_at and int(expires_at) <= oauth_store.now() + 300)
+    return {
+        "status": "success",
+        "service_user_id": user_id or None,
+        "basecamp_user_found": bool(user),
+        "authenticated": bool(user and not expired),
+        "active_account_id": user.get("active_account_id") if user else None,
+        "account_count": len(user.get("accounts", [])) if user else 0,
+        "expires_at": expires_at,
+        "expired": expired,
+        "expires_soon": expires_soon,
+        "has_refresh_token": bool(user and user.get("refresh_token")),
+        "refresh_error": refresh_error,
+    }
+
+
+def _service_basecamp_client() -> BasecampClient | None:
+    user = _service_basecamp_user()
+    if not user:
+        return None
+    if request_auth._is_basecamp_token_expired(user):
+        user = request_auth._refresh_basecamp_user(user)
+    if not user:
+        return None
+    account_id = str(user.get("active_account_id") or "")
+    if not account_id:
+        return None
+    return BasecampClient(
+        access_token=user["access_token"],
+        account_id=account_id,
+        user_agent=os.getenv("USER_AGENT") or "Basecamp MCP Server (support@example.com)",
+        auth_mode="oauth",
+    )
+
+
+@mcp.custom_route("/basecamp/api/auth/status", methods=["GET"])
+async def service_basecamp_auth_status(request: Request):
+    """Report Basecamp OAuth state for the service-token-bound user."""
+    if not _is_service_api_request(request):
+        return _service_api_unauthorized_response()
+    refresh = request.query_params.get("refresh", "").lower() in {"1", "true", "yes"}
+    return JSONResponse(_basecamp_auth_status_payload(refresh=refresh))
+
+
+@mcp.custom_route("/basecamp/api/auth/url", methods=["GET"])
+async def service_basecamp_auth_url(request: Request):
+    """Return a browser URL that reconnects Basecamp OAuth for API users."""
+    if not _is_service_api_request(request):
+        return _service_api_unauthorized_response()
+
+    user_id = _service_user_id()
+    if not user_id:
+        return JSONResponse(
+            {"error": "Missing configuration", "message": "BASECAMP_MCP_AUTH_USER_ID is required."},
+            status_code=500,
+        )
+
+    try:
+        authorization_url = create_service_reconnect_authorization_url(user_id)
+    except Exception as exc:
+        logger.exception("Failed to create Basecamp service reconnect URL")
+        return JSONResponse({"error": "Authorization URL error", "message": str(exc)}, status_code=500)
+
+    return JSONResponse(
+        {
+            "status": "success",
+            "authorization_url": authorization_url,
+            "service_user_id": user_id,
+            "callback_url": os.getenv("BASECAMP_REDIRECT_URI") or f"{public_base_url()}/basecamp/oauth/callback",
+        }
+    )
+
+
+@mcp.custom_route("/basecamp/api/webhooks/register-url", methods=["GET"])
+async def service_webhook_registration_url(request: Request):
+    """Return direct Basecamp API details for registering a webhook."""
+    if not _is_service_api_request(request):
+        return _service_api_unauthorized_response()
+
+    project_id = request.query_params.get("project_id")
+    if not project_id:
+        return JSONResponse({"error": "Invalid input", "message": "project_id is required."}, status_code=400)
+
+    user = _service_basecamp_user()
+    account_id = str(user.get("active_account_id") or os.getenv("BASECAMP_ACCOUNT_ID") or "") if user else ""
+    if not account_id:
+        return JSONResponse(
+            {"error": "Authentication required", "message": "Reconnect Basecamp OAuth before registering webhooks."},
+            status_code=409,
+        )
+
+    return JSONResponse(
+        {
+            "status": "success",
+            "method": "POST",
+            "url": f"https://3.basecampapi.com/{account_id}/buckets/{project_id}/webhooks.json",
+            "mcp_api_url": f"{public_base_url()}/basecamp/api/webhooks",
+            "headers": {
+                "Authorization": "Bearer <Basecamp OAuth access token>",
+                "Content-Type": "application/json",
+                "User-Agent": os.getenv("USER_AGENT") or "<configured USER_AGENT>",
+            },
+            "body_schema": {
+                "payload_url": "https://your-service.example.com/basecamp/webhook",
+                "types": ["Todo", "Todolist", "Comment"],
+            },
+        }
+    )
+
+
+@mcp.custom_route("/basecamp/api/webhooks", methods=["POST"])
+async def service_create_webhook(request: Request):
+    """Register a Basecamp webhook through the service-token API."""
+    if not _is_service_api_request(request):
+        return _service_api_unauthorized_response()
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid input", "message": "JSON body required."}, status_code=400)
+
+    project_id = str(payload.get("project_id") or "").strip()
+    payload_url = str(payload.get("payload_url") or "").strip()
+    types = payload.get("types")
+    if not project_id or not payload_url:
+        return JSONResponse(
+            {"error": "Invalid input", "message": "project_id and payload_url are required."},
+            status_code=400,
+        )
+    if types is not None and not isinstance(types, list):
+        return JSONResponse({"error": "Invalid input", "message": "types must be a list when provided."}, status_code=400)
+
+    try:
+        client = _service_basecamp_client()
+        if not client:
+            return JSONResponse(
+                {"error": "Authentication required", "message": "Reconnect Basecamp OAuth before registering webhooks."},
+                status_code=409,
+            )
+        hook = await _run_sync(client.create_webhook, project_id, payload_url, types)
+        return JSONResponse({"status": "success", "webhook": hook}, status_code=201)
+    except Exception as exc:
+        logger.exception("Service webhook registration failed")
+        return JSONResponse({"error": "Execution error", "message": str(exc)}, status_code=400)
 
 
 @mcp.custom_route("/basecamp/oauth/callback", methods=["GET"])

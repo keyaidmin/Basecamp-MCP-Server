@@ -63,6 +63,122 @@ def test_health_route_reports_ok():
     assert response.json() == {"status": "ok"}
 
 
+def service_headers():
+    return {"Authorization": "Bearer permanent-service-token"}
+
+
+def save_service_user(user_id="service-user"):
+    oauth_store.save_basecamp_user(
+        user_id=user_id,
+        identity={"identity": {"id": user_id, "email_address": "service@example.com"}},
+        accounts=[{"id": 111, "name": "First", "product": "bc3"}],
+        active_account_id="111",
+        access_token="basecamp-access",
+        refresh_token="basecamp-refresh",
+        expires_at=oauth_store.now() + 3600,
+    )
+
+
+def test_service_auth_status_route_requires_service_token(monkeypatch):
+    monkeypatch.setenv("BASECAMP_MCP_AUTH_TOKEN", "permanent-service-token")
+    monkeypatch.setenv("BASECAMP_MCP_AUTH_USER_ID", "service-user")
+    client = TestClient(basecamp_fastmcp.mcp.streamable_http_app())
+
+    response = client.get("/basecamp/api/auth/status")
+
+    assert response.status_code == 401
+
+
+def test_service_auth_status_route_reports_bound_basecamp_user(monkeypatch):
+    monkeypatch.setenv("BASECAMP_MCP_AUTH_TOKEN", "permanent-service-token")
+    monkeypatch.setenv("BASECAMP_MCP_AUTH_USER_ID", "service-user")
+    save_service_user()
+    client = TestClient(basecamp_fastmcp.mcp.streamable_http_app())
+
+    response = client.get("/basecamp/api/auth/status", headers=service_headers())
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["authenticated"] is True
+    assert body["service_user_id"] == "service-user"
+    assert body["active_account_id"] == "111"
+
+
+def test_service_auth_url_route_returns_basecamp_authorization_url(monkeypatch):
+    monkeypatch.setenv("BASECAMP_MCP_AUTH_TOKEN", "permanent-service-token")
+    monkeypatch.setenv("BASECAMP_MCP_AUTH_USER_ID", "service-user")
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://ai.services.key.study/mcp/bc")
+    monkeypatch.delenv("BASECAMP_REDIRECT_URI", raising=False)
+    client = TestClient(basecamp_fastmcp.mcp.streamable_http_app())
+
+    response = client.get("/basecamp/api/auth/url", headers=service_headers())
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["service_user_id"] == "service-user"
+    assert body["callback_url"] == "https://ai.services.key.study/mcp/bc/basecamp/oauth/callback"
+    assert "https://launchpad.37signals.com/authorization/new?" in body["authorization_url"]
+    assert "state=" in body["authorization_url"]
+
+
+def test_service_webhook_registration_url_route_returns_direct_basecamp_api_details(monkeypatch):
+    monkeypatch.setenv("BASECAMP_MCP_AUTH_TOKEN", "permanent-service-token")
+    monkeypatch.setenv("BASECAMP_MCP_AUTH_USER_ID", "service-user")
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://ai.services.key.study/mcp/bc")
+    save_service_user()
+    client = TestClient(basecamp_fastmcp.mcp.streamable_http_app())
+
+    response = client.get(
+        "/basecamp/api/webhooks/register-url?project_id=40016505",
+        headers=service_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["url"] == "https://3.basecampapi.com/111/buckets/40016505/webhooks.json"
+    assert body["mcp_api_url"] == "https://ai.services.key.study/mcp/bc/basecamp/api/webhooks"
+    assert body["headers"]["Authorization"] == "Bearer <Basecamp OAuth access token>"
+
+
+def test_service_create_webhook_route_registers_webhook(monkeypatch):
+    class FakeBasecampClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def create_webhook(self, project_id, payload_url, types=None):
+            return {
+                "id": 123,
+                "project_id": project_id,
+                "payload_url": payload_url,
+                "types": types,
+            }
+
+    monkeypatch.setenv("BASECAMP_MCP_AUTH_TOKEN", "permanent-service-token")
+    monkeypatch.setenv("BASECAMP_MCP_AUTH_USER_ID", "service-user")
+    monkeypatch.setattr(basecamp_fastmcp, "BasecampClient", FakeBasecampClient)
+    save_service_user()
+    client = TestClient(basecamp_fastmcp.mcp.streamable_http_app())
+
+    response = client.post(
+        "/basecamp/api/webhooks",
+        headers=service_headers(),
+        json={
+            "project_id": "40016505",
+            "payload_url": "https://example.com/basecamp/webhook",
+            "types": ["Todo", "Comment"],
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["webhook"] == {
+        "id": 123,
+        "project_id": "40016505",
+        "payload_url": "https://example.com/basecamp/webhook",
+        "types": ["Todo", "Comment"],
+    }
+
+
 class FakeBasecampOAuth:
     def __init__(self, *args, **kwargs):
         pass
