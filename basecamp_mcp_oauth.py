@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import os
 import secrets
 import time
@@ -26,6 +27,7 @@ AUTH_CODE_TTL_SECONDS = 5 * 60
 MCP_ACCESS_TOKEN_TTL_SECONDS = 60 * 60
 MCP_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60
 PENDING_STATE_TTL_SECONDS = 10 * 60
+SERVICE_TOKEN_CLIENT_ID = "basecamp-mcp-service"
 
 
 class BasecampAuthorizationCode(AuthorizationCode):
@@ -130,6 +132,23 @@ def _oauth_token_for(user_id: str, client_id: str, scopes: list[str], resource: 
         expires_in=MCP_ACCESS_TOKEN_TTL_SECONDS,
         scope=" ".join(scopes),
         refresh_token=refresh_token,
+    )
+
+
+def _configured_service_token(token: str) -> BasecampAccessToken | None:
+    configured_token = os.getenv("BASECAMP_MCP_AUTH_TOKEN", "").strip()
+    user_id = os.getenv("BASECAMP_MCP_AUTH_USER_ID", "").strip()
+    if not configured_token or not user_id:
+        return None
+    if not hmac.compare_digest(token, configured_token):
+        return None
+    return BasecampAccessToken(
+        token=token,
+        client_id=SERVICE_TOKEN_CLIENT_ID,
+        user_id=user_id,
+        scopes=[MCP_SCOPE],
+        expires_at=None,
+        resource=os.getenv("PUBLIC_MCP_URL") or None,
     )
 
 
@@ -298,6 +317,10 @@ class BasecampMcpOAuthProvider(
         )
 
     async def load_access_token(self, token: str) -> BasecampAccessToken | None:
+        service_token = _configured_service_token(token)
+        if service_token:
+            return service_token
+
         data = oauth_store.get_access_token(token)
         if not data:
             return None

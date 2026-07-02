@@ -123,6 +123,38 @@ async def test_provider_completes_basecamp_callback_and_issues_mcp_tokens(monkey
     assert loaded_access.scopes == ["basecamp"]
 
 
+@pytest.mark.anyio
+async def test_provider_accepts_configured_service_auth_token(monkeypatch):
+    monkeypatch.setenv("BASECAMP_MCP_AUTH_TOKEN", "permanent-service-token")
+    monkeypatch.setenv("BASECAMP_MCP_AUTH_USER_ID", "service-user")
+    monkeypatch.setenv("PUBLIC_MCP_URL", "https://ai.services.key.study/mcp/bc")
+
+    loaded_access = await BasecampMcpOAuthProvider().load_access_token("permanent-service-token")
+
+    assert loaded_access is not None
+    assert loaded_access.client_id == "basecamp-mcp-service"
+    assert loaded_access.user_id == "service-user"
+    assert loaded_access.scopes == ["basecamp"]
+    assert loaded_access.expires_at is None
+    assert loaded_access.resource == "https://ai.services.key.study/mcp/bc"
+
+
+@pytest.mark.anyio
+async def test_provider_rejects_invalid_service_auth_token(monkeypatch):
+    monkeypatch.setenv("BASECAMP_MCP_AUTH_TOKEN", "permanent-service-token")
+    monkeypatch.setenv("BASECAMP_MCP_AUTH_USER_ID", "service-user")
+
+    assert await BasecampMcpOAuthProvider().load_access_token("wrong-token") is None
+
+
+@pytest.mark.anyio
+async def test_provider_requires_user_binding_for_service_auth_token(monkeypatch):
+    monkeypatch.setenv("BASECAMP_MCP_AUTH_TOKEN", "permanent-service-token")
+    monkeypatch.delenv("BASECAMP_MCP_AUTH_USER_ID", raising=False)
+
+    assert await BasecampMcpOAuthProvider().load_access_token("permanent-service-token") is None
+
+
 def test_auth_settings_use_path_based_public_mcp_url(monkeypatch):
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://ai.services.key.study/mcp/bc")
     monkeypatch.setenv("PUBLIC_MCP_URL", "https://ai.services.key.study/mcp/bc")
