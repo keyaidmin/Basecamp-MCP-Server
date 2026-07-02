@@ -229,6 +229,21 @@ def get_basecamp_user(user_id: str) -> dict[str, Any] | None:
     }
 
 
+def find_basecamp_user_for_account(account_id: str) -> dict[str, Any] | None:
+    """Return the most recently authorized Basecamp user for an account."""
+    target_account_id = str(account_id)
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT user_id, accounts FROM basecamp_users ORDER BY updated_at DESC"
+        ).fetchall()
+    for row in rows:
+        accounts = _load_json(row["accounts"], [])
+        account_ids = {str(account.get("id")) for account in accounts}
+        if target_account_id in account_ids:
+            return get_basecamp_user(row["user_id"])
+    return None
+
+
 def set_active_basecamp_account(user_id: str, account_id: str) -> bool:
     """Set the active Basecamp account for a user if that account is available."""
     user = get_basecamp_user(user_id)

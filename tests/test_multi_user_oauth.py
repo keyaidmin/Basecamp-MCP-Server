@@ -122,6 +122,37 @@ def test_service_auth_url_route_returns_basecamp_authorization_url(monkeypatch):
     assert "state=" in body["authorization_url"]
 
 
+def test_service_auth_url_route_can_be_account_bound(monkeypatch):
+    monkeypatch.setenv("BASECAMP_MCP_AUTH_TOKEN", "permanent-service-token")
+    monkeypatch.delenv("BASECAMP_MCP_AUTH_USER_ID", raising=False)
+    monkeypatch.setenv("BASECAMP_MCP_AUTH_ACCOUNT_ID", "111")
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://ai.services.key.study/mcp/bc")
+    client = TestClient(basecamp_fastmcp.mcp.streamable_http_app())
+
+    response = client.get("/basecamp/api/auth/url", headers=service_headers())
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["service_user_id"] is None
+    assert body["service_account_id"] == "111"
+    assert "state=" in body["authorization_url"]
+
+
+@pytest.mark.anyio
+async def test_provider_accepts_configured_service_auth_token_for_latest_account_user(monkeypatch):
+    monkeypatch.setenv("BASECAMP_MCP_AUTH_TOKEN", "permanent-service-token")
+    monkeypatch.delenv("BASECAMP_MCP_AUTH_USER_ID", raising=False)
+    monkeypatch.setenv("BASECAMP_MCP_AUTH_ACCOUNT_ID", "111")
+    save_service_user(user_id="account-service-user")
+
+    loaded_access = await BasecampMcpOAuthProvider().load_access_token("permanent-service-token")
+
+    assert loaded_access is not None
+    assert loaded_access.client_id == "basecamp-mcp-service"
+    assert loaded_access.user_id == "account-service-user"
+    assert loaded_access.scopes == ["basecamp"]
+
+
 def test_service_webhook_registration_url_route_returns_direct_basecamp_api_details(monkeypatch):
     monkeypatch.setenv("BASECAMP_MCP_AUTH_TOKEN", "permanent-service-token")
     monkeypatch.setenv("BASECAMP_MCP_AUTH_USER_ID", "service-user")

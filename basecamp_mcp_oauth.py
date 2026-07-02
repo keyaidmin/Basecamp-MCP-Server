@@ -135,7 +135,24 @@ def _oauth_token_for(user_id: str, client_id: str, scopes: list[str], resource: 
     )
 
 
-def _store_basecamp_authorization(token_data: dict[str, Any], required_user_id: str | None = None) -> str:
+def _service_account_id() -> str | None:
+    return (os.getenv("BASECAMP_MCP_AUTH_ACCOUNT_ID") or os.getenv("BASECAMP_ACCOUNT_ID") or "").strip() or None
+
+
+def _service_user_id() -> str | None:
+    configured_user_id = os.getenv("BASECAMP_MCP_AUTH_USER_ID", "").strip()
+    if configured_user_id:
+        return configured_user_id
+    account_id = _service_account_id()
+    user = oauth_store.find_basecamp_user_for_account(account_id) if account_id else None
+    return str(user["user_id"]) if user else None
+
+
+def _store_basecamp_authorization(
+    token_data: dict[str, Any],
+    required_user_id: str | None = None,
+    required_account_id: str | None = None,
+) -> str:
     basecamp_access_token = token_data.get("access_token")
     if not basecamp_access_token:
         raise ValueError("Basecamp did not return an access token")
@@ -146,6 +163,8 @@ def _store_basecamp_authorization(token_data: dict[str, Any], required_user_id: 
     active_account_id = choose_active_account(identity)
     if not active_account_id:
         raise ValueError("Authenticated Basecamp user does not have access to the configured account")
+    if required_account_id and str(active_account_id) != str(required_account_id):
+        raise ValueError("Authenticated Basecamp user does not have access to the configured service account")
 
     user_id = extract_user_id(identity, basecamp_access_token)
     if required_user_id and user_id != required_user_id:
@@ -165,7 +184,7 @@ def _store_basecamp_authorization(token_data: dict[str, Any], required_user_id: 
 
 def _configured_service_token(token: str) -> BasecampAccessToken | None:
     configured_token = os.getenv("BASECAMP_MCP_AUTH_TOKEN", "").strip()
-    user_id = os.getenv("BASECAMP_MCP_AUTH_USER_ID", "").strip()
+    user_id = _service_user_id()
     if not configured_token or not user_id:
         return None
     if not hmac.compare_digest(token, configured_token):
@@ -180,13 +199,21 @@ def _configured_service_token(token: str) -> BasecampAccessToken | None:
     )
 
 
-def create_service_reconnect_authorization_url(user_id: str) -> str:
-    """Create a browser URL that refreshes Basecamp OAuth for the service user."""
+def create_service_reconnect_authorization_url(
+    user_id: str | None = None,
+    account_id: str | None = None,
+) -> str:
+    """Create a browser URL that refreshes Basecamp OAuth for the service account."""
     state = secrets.token_urlsafe(32)
+    auth_params = {"mode": "service_reconnect"}
+    if user_id:
+        auth_params["user_id"] = user_id
+    if account_id:
+        auth_params["account_id"] = account_id
     oauth_store.save_state(
         state,
         SERVICE_TOKEN_CLIENT_ID,
-        {"mode": "service_reconnect", "user_id": user_id},
+        auth_params,
         oauth_store.now() + PENDING_STATE_TTL_SECONDS,
     )
     oauth = BasecampOAuth(redirect_uri=basecamp_redirect_uri())
@@ -251,7 +278,11 @@ class BasecampMcpOAuthProvider(
         token_data = oauth.exchange_code_for_token(code)
         auth_params = pending["auth_params"]
         if auth_params.get("mode") == "service_reconnect":
-            _store_basecamp_authorization(token_data, required_user_id=auth_params.get("user_id"))
+            _store_basecamp_authorization(
+                token_data,
+                required_user_id=auth_params.get("user_id"),
+                required_account_id=auth_params.get("account_id"),
+            )
             return f"{public_base_url()}/health"
 
         user_id = _store_basecamp_authorization(token_data)

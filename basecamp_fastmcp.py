@@ -112,7 +112,16 @@ def _is_service_api_request(request: Request) -> bool:
 
 
 def _service_user_id() -> str:
-    return os.getenv("BASECAMP_MCP_AUTH_USER_ID", "").strip()
+    configured_user_id = os.getenv("BASECAMP_MCP_AUTH_USER_ID", "").strip()
+    if configured_user_id:
+        return configured_user_id
+    account_id = _service_account_id()
+    user = oauth_store.find_basecamp_user_for_account(account_id) if account_id else None
+    return str(user["user_id"]) if user else ""
+
+
+def _service_account_id() -> str:
+    return (os.getenv("BASECAMP_MCP_AUTH_ACCOUNT_ID") or os.getenv("BASECAMP_ACCOUNT_ID") or "").strip()
 
 
 def _service_api_unauthorized_response() -> JSONResponse:
@@ -144,6 +153,7 @@ def _basecamp_auth_status_payload(refresh: bool = False) -> dict[str, Any]:
     return {
         "status": "success",
         "service_user_id": user_id or None,
+        "service_account_id": _service_account_id() or None,
         "basecamp_user_found": bool(user),
         "authenticated": bool(user and not expired),
         "active_account_id": user.get("active_account_id") if user else None,
@@ -191,14 +201,21 @@ async def service_basecamp_auth_url(request: Request):
         return _service_api_unauthorized_response()
 
     user_id = _service_user_id()
-    if not user_id:
+    account_id = _service_account_id()
+    if not user_id and not account_id:
         return JSONResponse(
-            {"error": "Missing configuration", "message": "BASECAMP_MCP_AUTH_USER_ID is required."},
+            {
+                "error": "Missing configuration",
+                "message": "BASECAMP_MCP_AUTH_USER_ID or BASECAMP_MCP_AUTH_ACCOUNT_ID is required.",
+            },
             status_code=500,
         )
 
     try:
-        authorization_url = create_service_reconnect_authorization_url(user_id)
+        authorization_url = create_service_reconnect_authorization_url(
+            user_id=user_id or None,
+            account_id=account_id or None,
+        )
     except Exception as exc:
         logger.exception("Failed to create Basecamp service reconnect URL")
         return JSONResponse({"error": "Authorization URL error", "message": str(exc)}, status_code=500)
@@ -207,7 +224,8 @@ async def service_basecamp_auth_url(request: Request):
         {
             "status": "success",
             "authorization_url": authorization_url,
-            "service_user_id": user_id,
+            "service_user_id": user_id or None,
+            "service_account_id": account_id or None,
             "callback_url": os.getenv("BASECAMP_REDIRECT_URI") or f"{public_base_url()}/basecamp/oauth/callback",
         }
     )
