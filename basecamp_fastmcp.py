@@ -200,9 +200,9 @@ async def service_basecamp_auth_url(request: Request):
     if not _is_service_api_request(request):
         return _service_api_unauthorized_response()
 
-    user_id = _service_user_id()
+    configured_user_id = os.getenv("BASECAMP_MCP_AUTH_USER_ID", "").strip()
     account_id = _service_account_id()
-    if not user_id and not account_id:
+    if not configured_user_id and not account_id:
         return JSONResponse(
             {
                 "error": "Missing configuration",
@@ -213,7 +213,7 @@ async def service_basecamp_auth_url(request: Request):
 
     try:
         authorization_url = create_service_reconnect_authorization_url(
-            user_id=user_id or None,
+            user_id=configured_user_id or None,
             account_id=account_id or None,
         )
     except Exception as exc:
@@ -224,7 +224,8 @@ async def service_basecamp_auth_url(request: Request):
         {
             "status": "success",
             "authorization_url": authorization_url,
-            "service_user_id": user_id or None,
+            "service_user_id": configured_user_id or None,
+            "resolved_user_id": _service_user_id() or None,
             "service_account_id": account_id or None,
             "callback_url": os.getenv("BASECAMP_REDIRECT_URI") or f"{public_base_url()}/basecamp/oauth/callback",
         }

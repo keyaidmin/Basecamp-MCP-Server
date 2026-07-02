@@ -1,4 +1,5 @@
 import os
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -136,6 +137,25 @@ def test_service_auth_url_route_can_be_account_bound(monkeypatch):
     assert body["service_user_id"] is None
     assert body["service_account_id"] == "111"
     assert "state=" in body["authorization_url"]
+
+
+def test_account_bound_auth_url_does_not_pin_resolved_user(monkeypatch):
+    monkeypatch.setenv("BASECAMP_MCP_AUTH_TOKEN", "permanent-service-token")
+    monkeypatch.delenv("BASECAMP_MCP_AUTH_USER_ID", raising=False)
+    monkeypatch.setenv("BASECAMP_MCP_AUTH_ACCOUNT_ID", "111")
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://ai.services.key.study/mcp/bc")
+    save_service_user(user_id="previous-account-user")
+    client = TestClient(basecamp_fastmcp.mcp.streamable_http_app())
+
+    response = client.get("/basecamp/api/auth/url", headers=service_headers())
+
+    assert response.status_code == 200
+    body = response.json()
+    state = parse_qs(urlparse(body["authorization_url"]).query)["state"][0]
+    pending = oauth_store.pop_state(state)
+    assert pending["auth_params"] == {"mode": "service_reconnect", "account_id": "111"}
+    assert body["service_user_id"] is None
+    assert body["resolved_user_id"] == "previous-account-user"
 
 
 @pytest.mark.anyio
